@@ -11,16 +11,25 @@ def ler_relatorio_excel(file, usuario, mes_ano):
     for nome in xls.sheet_names:
         if "Ações" in nome:
             df_acoes = pd.read_excel(xls, sheet_name=nome, skiprows=1)
+            df_acoes = df_acoes.dropna(how='all')
             df_acoes["Tipo"] = "Ações"
-            historico.append(df_acoes)
+            if not df_acoes.empty:
+                print('Ações:', df_acoes.head())
+                historico.append(df_acoes)
         if "Renda Fixa" in nome:
             df_rf = pd.read_excel(xls, sheet_name=nome, skiprows=1)
+            df_rf = df_rf.dropna(how='all')
             df_rf["Tipo"] = "Renda Fixa"
-            historico.append(df_rf)
+            if not df_rf.empty:
+                print('Renda Fixa:', df_rf.head())
+                historico.append(df_rf)
         if "Proventos" in nome:
-            df_prov = pd.read_excel(xls, sheet_name=nome, skiprows=1)
+            df_prov = pd.read_excel(xls, sheet_name=nome, skiprows=0)
+            df_prov = df_prov.dropna(how='all')
             df_prov["Tipo"] = "Proventos"
-            historico.append(df_prov)
+            if not df_prov.empty:
+                print('Proventos:', df_prov.head())
+                historico.append(df_prov)
     if historico:
         df_total = pd.concat(historico, ignore_index=True)
         df_total["Mês/Ano"] = mes_ano

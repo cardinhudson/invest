@@ -1,4 +1,5 @@
 import streamlit as st
+st.set_page_config(layout="wide")
 import pandas as pd
 from modules.upload_relatorio import ler_relatorio_excel, salvar_tipo_parquet, ACOES_PATH, RENDA_FIXA_PATH, PROVENTOS_PATH
 from modules.usuarios import carregar_usuarios
@@ -39,10 +40,12 @@ if file and usuario and mes_ano:
         st.success("Renda Fixa processada e salva!")
         st.dataframe(df_rf)
         sucesso = True
+    # Sempre exibe o DataFrame de proventos, mesmo vazio, para debug
+    st.write("DataFrame de Proventos após processamento:")
+    st.dataframe(df_prov)
     if not df_prov.empty:
         salvar_tipo_parquet(df_prov, PROVENTOS_PATH)
         st.success("Proventos processados e salvos!")
-        st.dataframe(df_prov)
         sucesso = True
     if not sucesso:
         st.error("Arquivo não contém nenhuma das abas esperadas (Ações, Renda Fixa, Proventos).")

@@ -1,6 +1,6 @@
 
-
 import streamlit as st
+st.set_page_config(layout="wide")
 from modules.upload_relatorio import ler_relatorio_excel, salvar_historico_parquet, carregar_historico_parquet
 from modules.usuarios import carregar_usuarios
 

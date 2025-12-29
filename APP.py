@@ -6,7 +6,6 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import yfinance as yf
-from modules.upload_relatorio import carregar_historico_parquet
 from modules.usuarios import carregar_usuarios, salvar_usuarios
 
 st.set_page_config(page_title="Invest - Controle de Investimentos", layout="wide")
