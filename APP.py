@@ -22,8 +22,10 @@ except Exception:
 # Carregar usuários persistentes
 df_usuarios = carregar_usuarios()
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-    "Resumo", "Gráficos", "Histórico", "Comparações", "Cadastro", "Inserção Manual", "Upload CSV", "Alertas e Projeções"
+
+# Tabs para visualização por categoria e consolidado
+tab_consolidado, tab_acoes, tab_rf, tab_prov, tab5, tab6, tab7, tab8 = st.tabs([
+    "Consolidado", "Ações", "Renda Fixa", "Proventos", "Cadastro", "Inserção Manual", "Upload CSV", "Alertas e Projeções"
 ])
 
 # Aba Cadastro de Usuários
@@ -41,135 +43,82 @@ with tab5:
             st.error("Preencha todos os campos.")
     st.table(df_usuarios)
 
-# Aba Resumo
-with tab1:
-    st.header("Resumo Consolidado")
-    st.header("Filtros dos Investimentos")
-    # Filtro de usuário: apenas usuários cadastrados
-    usuarios = ["Todos"] + sorted(df_usuarios["Nome"].unique()) if not df_usuarios.empty else ["Todos"]
-    usuario_selecionado = st.selectbox("Filtrar por usuário", usuarios)
+import os
+def carregar_df_parquet(path):
+    if os.path.exists(path):
+        return pd.read_parquet(path)
+    else:
+        return pd.DataFrame()
+from modules.upload_relatorio import ACOES_PATH, RENDA_FIXA_PATH, PROVENTOS_PATH
 
-    # Filtro de período (mês/ano) como selectbox
-    periodos_disponiveis = ["Todos"]
-    if not df.empty and "Mês/Ano" in df.columns:
-        periodos_disponiveis += sorted(df["Mês/Ano"].dropna().unique(), key=lambda x: (int(x.split("/")[1]), int(x.split("/")[0])))
-    periodo_selecionado = st.selectbox("Filtrar por período (Mês/Ano)", periodos_disponiveis)
+# Aba Consolidado (tudo junto)
+with tab_consolidado:
+    st.header("Visão Consolidada de Investimentos")
+    df_acoes = carregar_df_parquet(ACOES_PATH)
+    df_rf = carregar_df_parquet(RENDA_FIXA_PATH)
+    df_prov = carregar_df_parquet(PROVENTOS_PATH)
+    # Consolidado só de ativos (ações + renda fixa)
+    df_consolidado = pd.concat([df_acoes, df_rf], ignore_index=True, sort=False)
+    st.dataframe(df_consolidado)
+    # Total do patrimônio (ações + renda fixa)
+    total_ativos = 0.0
+    if not df_consolidado.empty and "Valor Atualizado" in df_consolidado.columns:
+        total_ativos = df_consolidado["Valor Atualizado"].sum()
+    st.metric("Total em Ativos (Ações + Renda Fixa)", f"R$ {total_ativos:,.2f}")
+    # Proventos: mostrar total recebido, mas não somar ao patrimônio
+    total_proventos = 0.0
+    if not df_prov.empty and "Valor Líquido" in df_prov.columns:
+        total_proventos = df_prov["Valor Líquido"].sum()
+    st.metric("Total Recebido em Proventos", f"R$ {total_proventos:,.2f}")
 
-    categorias = ["Todas"]
-    acoes = ["Todas"]
-    if not df.empty:
-        if "Tipo" in df.columns:
-            categorias += sorted(df["Tipo"].dropna().unique())
-        if "Código de Negociação" in df.columns:
-            acoes += sorted(df["Código de Negociação"].dropna().unique())
-    categoria_selecionada = st.selectbox("Filtrar por categoria", categorias)
-    acao_selecionada = st.selectbox("Filtrar por ação", acoes)
+# Aba Ações
+with tab_acoes:
+    st.header("Ações")
+    df_acoes = carregar_df_parquet(ACOES_PATH)
+    st.dataframe(df_acoes)
 
-    # Sempre inicialize DataFrame filtrado
-    df_filtrado = df.copy() if not df.empty else pd.DataFrame()
-    if not df_filtrado.empty:
-        if usuario_selecionado != "Todos":
-            df_filtrado = df_filtrado[df_filtrado["Usuário"] == usuario_selecionado]
-        if periodo_selecionado != "Todos" and "Mês/Ano" in df_filtrado.columns:
-            df_filtrado = df_filtrado[df_filtrado["Mês/Ano"] == periodo_selecionado]
-        if categoria_selecionada != "Todas" and "Tipo" in df_filtrado.columns:
-            df_filtrado = df_filtrado[df_filtrado["Tipo"] == categoria_selecionada]
-        if acao_selecionada != "Todas" and "Código de Negociação" in df_filtrado.columns:
-            df_filtrado = df_filtrado[df_filtrado["Código de Negociação"] == acao_selecionada]
+# Aba Renda Fixa
+with tab_rf:
+    st.header("Renda Fixa")
+    df_rf = carregar_df_parquet(RENDA_FIXA_PATH)
+    st.dataframe(df_rf)
 
-    # Exibir total dos investimentos
-    if not df_filtrado.empty and "Valor Atualizado" in df_filtrado.columns:
-        st.metric("Total dos Investimentos", f"R$ {df_filtrado['Valor Atualizado'].sum():,.2f}")
-
-    # Exibir DataFrame filtrado
-    st.dataframe(df_filtrado)
-
-    # Busca de tickers com autocompletar
-    import yfinance as yf
-    st.header("Buscar Ticker do Mercado")
-    ticker_input = st.text_input("Digite o ticker para buscar (ex: PETR4.SA)")
-    if ticker_input:
-        try:
-            ticker = yf.Ticker(ticker_input)
-            hist = ticker.history(period="5y")
-            st.write(hist)
-            st.line_chart(hist["Close"])
-        except Exception as e:
-            st.error(f"Erro ao buscar ticker: {e}")
-
-    # Gráfico de evolução por período
-    st.header("Evolução do Patrimônio")
+# Aba Proventos
+with tab_prov:
+    st.header("Proventos")
+    df_prov = carregar_df_parquet(PROVENTOS_PATH)
+    st.dataframe(df_prov)
+    st.header("Evolução dos Proventos Recebidos")
     periodos = ["Mensal", "Bimestral", "Trimestral", "Semestral", "Anual"]
-    periodo = st.selectbox("Período", periodos)
-    if not df_filtrado.empty and "Mês/Ano" in df_filtrado.columns and "Valor Atualizado" in df_filtrado.columns:
-        df_filtrado["Data"] = pd.to_datetime(df_filtrado["Mês/Ano"], format="%m/%Y")
+    periodo = st.selectbox("Período", periodos, key="periodo_prov")
+    if not df_prov.empty and "Mês/Ano" in df_prov.columns and "Valor Líquido" in df_prov.columns:
+        df_prov["Data"] = pd.to_datetime(df_prov["Mês/Ano"], format="%m/%Y")
         if periodo == "Mensal":
-            df_group = df_filtrado.groupby([df_filtrado["Data"].dt.to_period("M")])["Valor Atualizado"].sum()
+            df_group = df_prov.groupby([df_prov["Data"].dt.to_period("M")])["Valor Líquido"].sum()
         elif periodo == "Bimestral":
-            df_group = df_filtrado.groupby([df_filtrado["Data"].dt.to_period("2M")])["Valor Atualizado"].sum()
+            df_group = df_prov.groupby([df_prov["Data"].dt.to_period("2M")])["Valor Líquido"].sum()
         elif periodo == "Trimestral":
-            df_group = df_filtrado.groupby([df_filtrado["Data"].dt.to_period("Q")])["Valor Atualizado"].sum()
+            df_group = df_prov.groupby([df_prov["Data"].dt.to_period("Q")])["Valor Líquido"].sum()
         elif periodo == "Semestral":
-            df_group = df_filtrado.groupby([df_filtrado["Data"].dt.to_period("6M")])["Valor Atualizado"].sum()
+            df_group = df_prov.groupby([df_prov["Data"].dt.to_period("6M")])["Valor Líquido"].sum()
         elif periodo == "Anual":
-            df_group = df_filtrado.groupby([df_filtrado["Data"].dt.year])["Valor Atualizado"].sum()
+            df_group = df_prov.groupby([df_prov["Data"].dt.year])["Valor Líquido"].sum()
+        df_group.index = df_group.index.astype(str)
+        st.subheader("Gráfico de Barras - Valor Recebido")
+        st.bar_chart(df_group)
+        st.subheader("Gráfico de Linha - Valor Recebido")
         st.line_chart(df_group)
-    elif not df_filtrado.empty:
+        # Gráfico de percentual mês a mês
+        st.subheader("Gráfico de Linha - Percentual de Crescimento (%)")
+        df_pct = df_group.pct_change().fillna(0) * 100
+        st.line_chart(df_pct)
+    elif not df_prov.empty:
         st.info("Dados insuficientes para gráfico de evolução.")
     else:
         st.info("Nenhum dado consolidado encontrado. Faça upload de relatórios na página apropriada.")
 
-# Aba Gráficos
-with tab2:
-    st.header("Gráficos Interativos")
-    if df.empty:
-        st.info("Nenhum dado consolidado para gráficos.")
-    else:
-        if "Categoria" in df.columns and "Valor" in df.columns:
-            fig_cat = px.pie(df, names="Categoria", values="Valor", title="Distribuição por Categoria")
-            st.plotly_chart(fig_cat)
-        if "Moeda" in df.columns and "Valor" in df.columns:
-            fig_moeda = px.pie(df, names="Moeda", values="Valor", title="Distribuição por Moeda")
-            st.plotly_chart(fig_moeda)
-        # Gráfico de linha de evolução
-        if "Mês/Ano" in df.columns:
-            df_graf = df.copy()
-            df_graf["Data"] = pd.to_datetime(df_graf["Mês/Ano"], format="%m/%Y")
-            if "Valor Atualizado" in df_graf.columns:
-                valor_col = "Valor Atualizado"
-            elif "Valor" in df_graf.columns:
-                valor_col = "Valor"
-            else:
-                valor_col = df_graf.select_dtypes(include=["number"]).columns[0] if not df_graf.select_dtypes(include=["number"]).empty else None
-            if valor_col:
-                df_group = df_graf.groupby([df_graf["Data"].dt.to_period("M")])[valor_col].sum()
-                st.subheader("Evolução do patrimônio (linha)")
-                st.line_chart(df_group)
+## As abas de Gráficos, Histórico e Comparações podem ser reimplementadas aqui se desejado, usando os novos DataFrames separados ou o consolidado.
 
-# Aba Histórico
-with tab3:
-    st.header("Histórico de Investimentos")
-    if df.empty:
-        st.info("Nenhum dado consolidado para histórico.")
-    else:
-        st.dataframe(df)
-
-# Aba Comparações
-with tab4:
-    st.header("Comparação com Benchmarks")
-    st.write("Ibovespa vs Dólar vs CDI")
-    try:
-        import numpy as np
-        ibov = pd.DataFrame()
-        dolar = pd.DataFrame()
-        # Exemplo fictício, substitua por busca real se desejar
-        ibov["Ibovespa"] = np.random.normal(100000, 5000, 12)
-        dolar["Dólar"] = np.random.normal(5, 0.2, 12)
-        st.line_chart(ibov)
-        st.line_chart(dolar)
-        st.write("Taxa CDI anual simulada: 10.5%")
-    except Exception as e:
-        st.error(f"Erro ao buscar benchmarks: {e}")
 
 # Aba Inserção Manual
 with tab6:
