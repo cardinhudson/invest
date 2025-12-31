@@ -1,0 +1,365 @@
+import pandas as pd
+import os
+
+PARQUET_PATH = "data/historico_investimentos.parquet"
+ACOES_PATH = "data/acoes.parquet"
+RENDA_FIXA_PATH = "data/renda_fixa.parquet"
+PROVENTOS_PATH = "data/proventos.parquet"
+
+def garantir_pasta_data():
+    """Cria a pasta data/ se não existir."""
+    if not os.path.exists("data"):
+        os.makedirs("data")
+        print("Pasta 'data/' criada com sucesso.")
+
+def limpar_colunas_duplicadas(df):
+    """Remove duplicatas de nomes de colunas renomeando-as."""
+    cols = pd.Series(df.columns)
+    for dup in cols[cols.duplicated()].unique():
+        idxs = cols[cols == dup].index.tolist()
+        for i, idx in enumerate(idxs):
+            if i == 0:
+                continue
+            cols[idx] = f"{dup}.{i}"
+    df.columns = cols
+    return df
+
+def remover_linhas_irrelevantes(df, colunas_verificar):
+    """Remove linhas que contêm 'total', 'subtotal' nas colunas especificadas."""
+    df = df.copy()
+    for col in colunas_verificar:
+        if col in df.columns:
+            # Remove linhas com 'total' ou 'subtotal' apenas em colunas de texto
+            df = df[~df[col].astype(str).str.lower().str.contains("total|subtotal", na=False)]
+    return df
+
+def processar_renda_fixa(xls, usuario, mes_ano):
+    """Processa a planilha de Renda Fixa com as regras especificadas."""
+    df_rf = pd.DataFrame()
+    
+    # Buscar aba com variações de nome
+    aba_encontrada = None
+    for nome in xls.sheet_names:
+        nome_lower = nome.lower().replace(" ", "").replace("_", "")
+        if any(termo in nome_lower for termo in ["rendafixa", "renda", "rf", "fixo"]):
+            aba_encontrada = nome
+            break
+    
+    if not aba_encontrada:
+        print("⚠ Nenhuma aba de Renda Fixa encontrada!")
+        print(f"Abas disponíveis: {xls.sheet_names}")
+        return df_rf
+    
+    print(f"\n=== Processando Renda Fixa: {aba_encontrada} ===")
+    df_rf = pd.read_excel(xls, sheet_name=aba_encontrada, skiprows=1)
+    df_rf = limpar_colunas_duplicadas(df_rf)
+    print(f"Linhas lidas do Excel: {len(df_rf)}")
+    print(f"Colunas disponíveis: {list(df_rf.columns)}")
+    
+    # Mostrar preview dos dados
+    if len(df_rf) > 0:
+        print(f"\nPreview das primeiras 3 linhas:")
+        print(df_rf.head(3).to_string())
+    
+    # Colunas essenciais
+    colunas_essenciais = [
+        "Produto", "Instituição", "Emissor", "Código", "Indexador", "Tipo de regime",
+        "Data de Emissão", "Vencimento", "Quantidade", "Quantidade Disponível",
+        "Quantidade Indisponível", "Motivo", "Contraparte", "Preço Atualizado MTM",
+        "Valor Atualizado MTM", "Preço Atualizado CURVA", "Valor Atualizado CURVA"
+    ]
+    
+    # Mapear colunas com busca flexível
+    print("\n--- Mapeamento de Colunas ---")
+    for col in colunas_essenciais:
+        if col not in df_rf.columns:
+            for c in df_rf.columns:
+                # Busca case-insensitive e parcial
+                if col.lower() in str(c).lower():
+                    df_rf[col] = df_rf[c]
+                    print(f"✓ Mapeado: '{c}' -> '{col}'")
+                    break
+    
+    # Verificar se temos as colunas mínimas necessárias
+    if "Produto" not in df_rf.columns:
+        print("\n⚠ ERRO: Coluna 'Produto' não encontrada! Tentando primeira coluna não-vazia...")
+        # Fallback: usar primeira coluna como Produto
+        for c in df_rf.columns:
+            if df_rf[c].notna().any():
+                df_rf["Produto"] = df_rf[c]
+                print(f"✓ Usando '{c}' como Produto")
+                break
+    
+    # Criar coluna Valor
+    print("\n--- Criando coluna Valor ---")
+    df_rf["Valor"] = None
+    
+    # Prioridade: Valor Atualizado MTM
+    if "Valor Atualizado MTM" in df_rf.columns:
+        df_rf["Valor"] = pd.to_numeric(df_rf["Valor Atualizado MTM"], errors="coerce")
+        valores_mtm = df_rf["Valor"].notna().sum()
+        print(f"✓ Valores de MTM encontrados: {valores_mtm}")
+    
+    # Complementar com Valor Atualizado CURVA
+    if "Valor Atualizado CURVA" in df_rf.columns:
+        mask_vazio = df_rf["Valor"].isna()
+        df_rf.loc[mask_vazio, "Valor"] = pd.to_numeric(df_rf.loc[mask_vazio, "Valor Atualizado CURVA"], errors="coerce")
+        valores_curva = mask_vazio.sum()
+        print(f"✓ Complementado com CURVA: {valores_curva} valores")
+    
+    print(f"Total de valores válidos: {df_rf['Valor'].notna().sum()}")
+    
+    # Remover linhas de total/subtotal apenas na coluna Produto
+    print("\n--- Filtrando dados ---")
+    linhas_inicial = len(df_rf)
+    
+    # Filtro 1: Remover total/subtotal
+    if "Produto" in df_rf.columns:
+        df_rf = df_rf[~df_rf["Produto"].astype(str).str.lower().str.contains("total|subtotal", na=False)]
+        print(f"✓ Removidas linhas total/subtotal: {linhas_inicial - len(df_rf)}")
+    
+    # Filtro 2: Manter apenas linhas com Produto preenchido
+    linhas_antes_produto = len(df_rf)
+    df_rf = df_rf[df_rf["Produto"].notna() & (df_rf["Produto"].astype(str).str.strip() != "")]
+    print(f"✓ Removidas linhas sem Produto: {linhas_antes_produto - len(df_rf)}")
+    
+    # Filtro 3: Manter apenas linhas com Valor > 0
+    if "Valor" in df_rf.columns:
+        linhas_antes_valor = len(df_rf)
+        df_rf = df_rf[df_rf["Valor"].notna() & (df_rf["Valor"] > 0)]
+        print(f"✓ Removidas linhas sem Valor válido: {linhas_antes_valor - len(df_rf)}")
+    
+    # Adicionar metadados
+    df_rf["Mês/Ano"] = mes_ano
+    df_rf["Usuário"] = usuario
+    
+    # Selecionar apenas colunas que existem
+    colunas_finais = [col for col in colunas_essenciais + ["Valor", "Mês/Ano", "Usuário"] if col in df_rf.columns]
+    df_rf = df_rf[colunas_finais]
+    
+    print(f"\n✅ Processamento concluído: {len(df_rf)} linhas finais")
+    if len(df_rf) > 0:
+        print(f"Colunas finais: {list(df_rf.columns)}")
+    df_acoes = limpar_colunas_duplicadas(df_acoes)
+    print(f"Linhas lidas do Excel: {len(df_acoes)}")
+    print(f"Colunas disponíveis: {list(df_acoes.columns)}")
+            
+            # Mostrar preview dos dados
+            if len(df_acoes) > 0:
+                print(f"\nPreview das primeiras 3 linhas:")
+                print(df_acoes.head(3).to_string())
+            
+            # Colunas essenciais
+            colunas_essenciais = [
+                "Produto", "Instituição", "Conta", "Código de Negociação", "CNPJ da Empresa",
+                "Código ISIN / Distribuição", "Tipo", "Escriturador", "Quantidade",
+                "Quantidade Disponível", "Quantidade Indisponível", "Motivo",
+                "Preço de Fechamento", "Valor Atualizado"
+            ]
+            
+            # Mapear colunas com busca flexível
+            print("\n--- Mapeamento de Colunas ---")
+            for col in colunas_essenciais:
+                if col not in df_acoes.columns:
+                    for c in df_acoes.columns:
+                        # Busca case-insensitive e parcial
+                        if col.lower() in str(c).lower():
+                            df_acoes[col] = df_acoes[c]
+                            print(f"✓ Mapeado: '{c}' -> '{col}'")
+                            break
+            
+            # Verificar se temos as colunas mínimas necessárias
+            if "Produto" not in df_acoes.columns:
+                print("\n⚠ ERRO: Coluna 'Produto' não encontrada! Tentando primeira coluna não-vazia...")
+                # Fallback: usar primeira coluna como Produto
+                for c in df_acoes.columns:
+                    if df_acoes[c].notna().any():
+                        df_acoes["Produto"] = df_acoes[c]
+                        print(f"✓ Usando '{c}' como Produto")
+                        break
+            
+            # Criar coluna Valor a partir de "Valor Atualizado"
+            print("\n--- Criando coluna Valor ---")
+            if "Valor Atualizado" in df_acoes.columns:
+                df_acoes["Valor"] = pd.to_numeric(df_acoes["Valor Atualizado"], errors="coerce")
+                # Remover a coluna original para evitar duplicação
+                df_acoes = df_acoes.drop(columns=["Valor Atualizado"])
+                valores_validos = df_acoes["Valor"].notna().sum()
+                print(f"✓ Valores válidos encontrados: {valores_validos}")
+            else:
+                print("⚠ Coluna 'Valor Atualizado' não encontrada")
+                df_acoes["Valor"] = None
+            
+            # Remover linhas de total/subtotal apenas na coluna Produto
+            print("\n--- Filtrando dados ---")
+            linhas_inicial = len(df_acoes)
+            
+            # Filtro 1: Remover total/subtotal
+            if "Produto" in df_acoes.columns:
+                df_acoes = df_acoes[~df_acoes["Produto"].astype(str).str.lower().str.contains("total|subtotal", na=False)]
+                print(f"✓ Removidas linhas total/subtotal: {linhas_inicial - len(df_acoes)}")
+            
+            # Filtro 2: Manter apenas linhas com Produto preenchido
+            linhas_antes_produto = len(df_acoes)
+            df_acoes = df_acoes[df_acoes["Produto"].notna() & (df_acoes["Produto"].astype(str).str.strip() != "")]
+            print(f"✓ Removidas linhas sem Produto: {linhas_antes_produto - len(df_acoes)}")
+            
+            # Filtro 3: Manter apenas linhas com Valor > 0
+            if "Valor" in df_acoes.columns:
+                linhas_antes_valor = len(df_acoes)
+                df_acoes = df_acoes[df_acoes["Valor"].notna() & (df_acoes["Valor"] > 0)]
+                print(f"✓ Removidas linhas sem Valor válido: {linhas_antes_valor - len(df_acoes)}")
+        
+        # Adicionar metadados
+        df_acoes["Mês/Ano"] = mes_ano
+        df_acoes["Usuário"] = usuario
+        
+        # Selecionar apenas colunas que existem
+        colunas_finais = [col for col in colunas_essenciais + ["Valor", "Mês/Ano", "Usuário"] if col in df_acoes.columns]
+        # Remover "Valor Atualizado" da lista final se ainda existir
+        colunas_finais = [col for col in colunas_finais if col != "Valor Atualizado"]
+        df_acoes = df_acoes[colunas_finais]
+        
+        print(f"\n✅ Processamento concluído: {len(df_acoes)} linhas finais")
+        if len(df_acoes) > 0:
+            print(f"Colunas finais: {list(df_acoes.columns)}")
+    
+    return df_acoes
+
+def processar_proventos(xls, usuario, mes_ano):
+    """Processa a planilha de Proventos com as regras especificadas."""
+    df_prov = pd.DataFrame()
+    
+    for nome in xls.sheet_names:
+        if "Proventos" in nome:
+            print(f"Processando Proventos: {nome}")
+            
+            # Detectar linha de header
+            df_tmp = pd.read_excel(xls, sheet_name=nome, header=None)
+            header_row = 0
+            for i in range(min(10, len(df_tmp))):
+                row = df_tmp.iloc[i].astype(str).str.lower().tolist()
+                if any(term in " ".join(row) for term in ["valor liquido", "valor do provento"]):
+                    header_row = i
+                    break
+            
+            df_prov = pd.read_excel(xls, sheet_name=nome, header=header_row)
+            df_prov = limpar_colunas_duplicadas(df_prov)
+            print(f"  Linhas antes do processamento: {len(df_prov)}")
+            
+            # Colunas essenciais
+            colunas_essenciais = ["Produto", "Data de Pagamento", "Tipo de Provento", "Valor Líquido"]
+            
+            # Mapear colunas se não existirem
+            for col in colunas_essenciais:
+                if col not in df_prov.columns:
+                    for c in df_prov.columns:
+                        if col.lower() in str(c).lower():
+                            df_prov[col] = df_prov[c]
+                            break
+            
+            # Converter Valor Líquido para numérico
+            if "Valor Líquido" in df_prov.columns:
+                df_prov["Valor Líquido"] = pd.to_numeric(df_prov["Valor Líquido"], errors="coerce")
+            
+            # Remover linhas de total/subtotal e vazias
+            df_prov = remover_linhas_irrelevantes(df_prov, colunas_essenciais)
+            
+            # Remover explicitamente a última linha se for total/subtotal
+            if len(df_prov) > 0:
+                ultima = df_prov.iloc[-1]
+                if (any(str(ultima[col]).lower().strip() in ["total", "subtotal"] for col in colunas_essenciais if col in df_prov.columns)
+                    or pd.isna(ultima.get("Produto")) or str(ultima.get("Produto", "")).strip() == ""):
+                    df_prov = df_prov.iloc[:-1]
+            
+            # Só considerar linhas com Produto e Valor Líquido válidos, se 'Produto' existir
+            if "Produto" in df_prov.columns:
+                if "Valor Líquido" in df_prov.columns:
+                    df_prov = df_prov[(df_prov["Produto"].notna()) & (df_prov["Valor Líquido"].notna()) & (df_prov["Valor Líquido"] > 0)]
+                else:
+                    df_prov = df_prov[df_prov["Produto"].notna()]
+            else:
+                print("⚠ Coluna 'Produto' não encontrada após o mapeamento. DataFrame de Proventos será vazio.")
+                return pd.DataFrame()
+
+            # Adicionar metadados
+            df_prov["Mês/Ano"] = mes_ano
+            df_prov["Usuário"] = usuario
+
+            # Selecionar apenas colunas essenciais
+            colunas_finais = [col for col in colunas_essenciais + ["Mês/Ano", "Usuário"] if col in df_prov.columns]
+            df_prov = df_prov[colunas_finais]
+            
+            print(f"  Linhas após processamento: {len(df_prov)}")
+            break
+    
+    return df_prov
+
+def ler_relatorio_excel(file, usuario, mes_ano):
+    """Lê e processa o arquivo Excel completo."""
+    xls = pd.ExcelFile(file)
+    
+    print(f"\n{'='*80}")
+    print(f"INICIANDO LEITURA DO ARQUIVO")
+    print(f"{'='*80}")
+    print(f"Usuário: {usuario}")
+    print(f"Período: {mes_ano}")
+    print(f"Abas disponíveis no Excel: {xls.sheet_names}")
+    print(f"{'='*80}\n")
+    
+    df_acoes = processar_acoes(xls, usuario, mes_ano)
+    print(f"\n>>> Resultado Ações: {len(df_acoes)} linhas\n")
+    
+    df_rf = processar_renda_fixa(xls, usuario, mes_ano)
+    print(f"\n>>> Resultado Renda Fixa: {len(df_rf)} linhas\n")
+    
+    df_prov = processar_proventos(xls, usuario, mes_ano)
+    print(f"\n>>> Resultado Proventos: {len(df_prov)} linhas\n")
+    
+    return df_acoes, df_rf, df_prov
+
+def salvar_tipo_parquet(df_tipo, path):
+    """Salva DataFrame em formato Parquet com lógica cumulativa."""
+    garantir_pasta_data()
+    
+    if df_tipo.empty or len(df_tipo) == 0:
+        print(f"⚠ Nenhuma linha para salvar em {path}")
+        return df_tipo
+    
+    # Carregar dados existentes se o arquivo já existe
+    if os.path.exists(path):
+        print(f"Carregando dados existentes de {path}")
+        df_existente = pd.read_parquet(path)
+        
+        # Remover dados do mesmo usuário/mês
+        if "Usuário" in df_tipo.columns and "Mês/Ano" in df_tipo.columns:
+            usuario = df_tipo["Usuário"].iloc[0]
+            mes_ano = df_tipo["Mês/Ano"].iloc[0]
+            
+            linhas_antes = len(df_existente)
+            df_existente = df_existente[
+                ~((df_existente["Usuário"] == usuario) & (df_existente["Mês/Ano"] == mes_ano))
+            ]
+            linhas_removidas = linhas_antes - len(df_existente)
+            if linhas_removidas > 0:
+                print(f"  Removidas {linhas_removidas} linhas antigas de {usuario}/{mes_ano}")
+        
+        # Concatenar dados
+        df_final = pd.concat([df_existente, df_tipo], ignore_index=True)
+        print(f"  Total de linhas após concatenação: {len(df_final)}")
+    else:
+        df_final = df_tipo
+    
+    # Salvar arquivo
+    print(f"Salvando {len(df_final)} linhas em {path}")
+    df_final.to_parquet(path, index=False)
+    print(f"✓ Arquivo salvo com sucesso: {path}")
+    
+    return df_final
+
+def carregar_historico_parquet():
+    """Carrega o histórico de investimentos."""
+    if os.path.exists(PARQUET_PATH):
+        return pd.read_parquet(PARQUET_PATH)
+    else:
+        return pd.DataFrame()

@@ -1,15 +1,17 @@
-import sys
 
-
-
+import os
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import yfinance as yf
+
 from modules.usuarios import carregar_usuarios, salvar_usuarios
+from modules.upload_relatorio import carregar_historico_parquet, ACOES_PATH, RENDA_FIXA_PATH, PROVENTOS_PATH
+from src.modules.alerts import calcular_projecao_avancada
 
 st.set_page_config(page_title="Invest - Controle de Investimentos", layout="wide")
 st.title("💰 Invest - Controle de Investimentos")
+
 
 # Carregar histórico consolidado
 try:
@@ -17,10 +19,18 @@ try:
 except Exception:
     df = pd.DataFrame()
 
-
 # Carregar usuários persistentes
 df_usuarios = carregar_usuarios()
 
+# Função para carregar DataFrame Parquet
+def carregar_df_parquet(path):
+    if os.path.exists(path):
+        try:
+            return pd.read_parquet(path)
+        except Exception:
+            return pd.DataFrame()
+    else:
+        return pd.DataFrame()
 
 # Tabs para visualização por categoria e consolidado
 tab_consolidado, tab_acoes, tab_rf, tab_prov, tab5, tab6, tab7, tab8 = st.tabs([
@@ -42,13 +52,7 @@ with tab5:
             st.error("Preencha todos os campos.")
     st.table(df_usuarios)
 
-import os
-def carregar_df_parquet(path):
-    if os.path.exists(path):
-        return pd.read_parquet(path)
-    else:
-        return pd.DataFrame()
-from modules.upload_relatorio import ACOES_PATH, RENDA_FIXA_PATH, PROVENTOS_PATH
+
 
 # Aba Consolidado (tudo junto)
 with tab_consolidado:
@@ -60,14 +64,10 @@ with tab_consolidado:
     df_consolidado = pd.concat([df_acoes, df_rf], ignore_index=True, sort=False)
     st.dataframe(df_consolidado)
     # Total do patrimônio (ações + renda fixa)
-    total_ativos = 0.0
-    if not df_consolidado.empty and "Valor Atualizado" in df_consolidado.columns:
-        total_ativos = df_consolidado["Valor Atualizado"].sum()
+    total_ativos = df_consolidado["Valor Atualizado"].sum() if not df_consolidado.empty and "Valor Atualizado" in df_consolidado.columns else 0.0
     st.metric("Total em Ativos (Ações + Renda Fixa)", f"R$ {total_ativos:,.2f}")
     # Proventos: mostrar total recebido, mas não somar ao patrimônio
-    total_proventos = 0.0
-    if not df_prov.empty and "Valor Líquido" in df_prov.columns:
-        total_proventos = df_prov["Valor Líquido"].sum()
+    total_proventos = df_prov["Valor Líquido"].sum() if not df_prov.empty and "Valor Líquido" in df_prov.columns else 0.0
     st.metric("Total Recebido em Proventos", f"R$ {total_proventos:,.2f}")
 
 # Aba Ações
@@ -82,6 +82,7 @@ with tab_rf:
     df_rf = carregar_df_parquet(RENDA_FIXA_PATH)
     st.dataframe(df_rf)
 
+
 # Aba Proventos
 with tab_prov:
     st.header("Proventos")
@@ -91,26 +92,29 @@ with tab_prov:
     periodos = ["Mensal", "Bimestral", "Trimestral", "Semestral", "Anual"]
     periodo = st.selectbox("Período", periodos, key="periodo_prov")
     if not df_prov.empty and "Mês/Ano" in df_prov.columns and "Valor Líquido" in df_prov.columns:
-        df_prov["Data"] = pd.to_datetime(df_prov["Mês/Ano"], format="%m/%Y")
-        if periodo == "Mensal":
-            df_group = df_prov.groupby([df_prov["Data"].dt.to_period("M")])["Valor Líquido"].sum()
-        elif periodo == "Bimestral":
-            df_group = df_prov.groupby([df_prov["Data"].dt.to_period("2M")])["Valor Líquido"].sum()
-        elif periodo == "Trimestral":
-            df_group = df_prov.groupby([df_prov["Data"].dt.to_period("Q")])["Valor Líquido"].sum()
-        elif periodo == "Semestral":
-            df_group = df_prov.groupby([df_prov["Data"].dt.to_period("6M")])["Valor Líquido"].sum()
-        elif periodo == "Anual":
-            df_group = df_prov.groupby([df_prov["Data"].dt.year])["Valor Líquido"].sum()
-        df_group.index = df_group.index.astype(str)
-        st.subheader("Gráfico de Barras - Valor Recebido")
-        st.bar_chart(df_group)
-        st.subheader("Gráfico de Linha - Valor Recebido")
-        st.line_chart(df_group)
-        # Gráfico de percentual mês a mês
-        st.subheader("Gráfico de Linha - Percentual de Crescimento (%)")
-        df_pct = df_group.pct_change().fillna(0) * 100
-        st.line_chart(df_pct)
+        try:
+            df_prov["Data"] = pd.to_datetime(df_prov["Mês/Ano"], format="%m/%Y")
+            if periodo == "Mensal":
+                df_group = df_prov.groupby([df_prov["Data"].dt.to_period("M")])["Valor Líquido"].sum()
+            elif periodo == "Bimestral":
+                df_group = df_prov.groupby([df_prov["Data"].dt.to_period("2M")])["Valor Líquido"].sum()
+            elif periodo == "Trimestral":
+                df_group = df_prov.groupby([df_prov["Data"].dt.to_period("Q")])["Valor Líquido"].sum()
+            elif periodo == "Semestral":
+                df_group = df_prov.groupby([df_prov["Data"].dt.to_period("6M")])["Valor Líquido"].sum()
+            elif periodo == "Anual":
+                df_group = df_prov.groupby([df_prov["Data"].dt.year])["Valor Líquido"].sum()
+            df_group.index = df_group.index.astype(str)
+            st.subheader("Gráfico de Barras - Valor Recebido")
+            st.bar_chart(df_group)
+            st.subheader("Gráfico de Linha - Valor Recebido")
+            st.line_chart(df_group)
+            # Gráfico de percentual mês a mês
+            st.subheader("Gráfico de Linha - Percentual de Crescimento (%)")
+            df_pct = df_group.pct_change().fillna(0) * 100
+            st.line_chart(df_pct)
+        except Exception as e:
+            st.error(f"Erro ao gerar gráficos: {e}")
     elif not df_prov.empty:
         st.info("Dados insuficientes para gráfico de evolução.")
     else:
@@ -130,10 +134,13 @@ with tab7:
     st.info("Funcionalidade em desenvolvimento.")
 
 # Aba Alertas e Projeções
+
 with tab8:
     st.header("Alertas e Projeções")
-    st.info("Funcionalidade em desenvolvimento.")
-
+    st.info("Simule sua projeção de investimentos!")
+    aporte_mensal = st.number_input("Aporte mensal (R$)", min_value=0.0, value=1000.0, step=100.0)
+    taxa_juros = st.number_input("Taxa de juros anual (%)", min_value=0.0, value=10.0, step=0.1)
+    anos = st.number_input("Anos de investimento", min_value=1, value=10, step=1)
     if st.button("Calcular Projeção"):
         futuro = calcular_projecao_avancada(aporte_mensal, taxa_juros, anos)
         st.success(f"Projeção futura: R$ {futuro:,.2f}")
