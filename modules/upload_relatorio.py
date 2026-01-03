@@ -326,3 +326,147 @@ def carregar_historico_parquet():
     if os.path.exists(PARQUET_PATH):
         return pd.read_parquet(PARQUET_PATH)
     return pd.DataFrame()
+
+
+def padronizar_renda_fixa(df_rf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Padroniza DataFrame de Renda Fixa para colunas:
+    Produto, Código, Quantidade Disponível, Preço, Valor
+    """
+    df = df_rf.copy()
+    
+    # Seleciona coluna de preço (prefere MTM, depois CURVA)
+    preco_col = None
+    if "Preço Atualizado MTM" in df.columns and df["Preço Atualizado MTM"].notna().any():
+        preco_col = "Preço Atualizado MTM"
+    elif "Preço Atualizado CURVA" in df.columns:
+        preco_col = "Preço Atualizado CURVA"
+    
+    # Monta resultado com colunas padronizadas
+    resultado = pd.DataFrame()
+    resultado["Produto"] = df.get("Produto")
+    resultado["Código"] = df.get("Código")
+    resultado["Quantidade Disponível"] = df.get("Quantidade Disponível")
+    resultado["Preço"] = df.get(preco_col) if preco_col else None
+    resultado["Valor"] = df.get("Valor")
+    resultado["Usuário"] = df.get("Usuário")
+    resultado["Mês/Ano"] = df.get("Mês/Ano")
+    
+    # Converte para numérico
+    for col in ["Quantidade Disponível", "Preço", "Valor"]:
+        resultado[col] = pd.to_numeric(resultado[col], errors="coerce")
+    
+    return resultado
+
+
+def padronizar_acoes(df_acoes: pd.DataFrame) -> pd.DataFrame:
+    """
+    Padroniza DataFrame de Ações para colunas:
+    Produto, Código, Quantidade Disponível, Preço, Valor
+    """
+    df = df_acoes.copy()
+    
+    # Monta resultado com colunas padronizadas
+    resultado = pd.DataFrame()
+    resultado["Produto"] = df.get("Produto")
+    resultado["Código"] = df.get("Código de Negociação")
+    resultado["Quantidade Disponível"] = df.get("Quantidade Disponível")
+    resultado["Preço"] = df.get("Preço de Fechamento")
+    resultado["Valor"] = df.get("Valor")
+    resultado["Usuário"] = df.get("Usuário")
+    resultado["Mês/Ano"] = df.get("Mês/Ano")
+    
+    # Converte para numérico
+    for col in ["Quantidade Disponível", "Preço", "Valor"]:
+        resultado[col] = pd.to_numeric(resultado[col], errors="coerce")
+    
+    return resultado
+
+
+def _is_tesouro(produto: str, codigo: str) -> bool:
+    texto = " ".join([
+        str(produto or ""),
+        str(codigo or ""),
+    ]).lower()
+    return any(pat in texto for pat in ["tesouro", "ltn", "lft", "ntn", "ntnb", "ntnf", "selic", "ipca+"])
+
+
+def padronizar_tabelas(df_acoes: pd.DataFrame, df_renda_fixa: pd.DataFrame) -> pd.DataFrame:
+    """
+    Consolida Ações e Renda Fixa em um único DataFrame com colunas padronizadas.
+    Retorna um DataFrame com colunas: Produto, Código, Quantidade Disponível, Preço, Valor, Tipo
+    """
+    df_acoes_pad = padronizar_acoes(df_acoes) if not df_acoes.empty else pd.DataFrame()
+    df_rf_pad = padronizar_renda_fixa(df_renda_fixa) if not df_renda_fixa.empty else pd.DataFrame()
+    
+    # Adiciona coluna de tipo
+    if not df_acoes_pad.empty:
+        df_acoes_pad["Tipo"] = "Ações"
+        mask_td_acoes = df_acoes_pad.apply(lambda r: _is_tesouro(r.get("Produto"), r.get("Código")), axis=1)
+        df_acoes_pad.loc[mask_td_acoes, "Tipo"] = "Tesouro Direto"
+    if not df_rf_pad.empty:
+        df_rf_pad["Tipo"] = "Renda Fixa"
+        mask_td_rf = df_rf_pad.apply(lambda r: _is_tesouro(r.get("Produto"), r.get("Código")), axis=1)
+        df_rf_pad.loc[mask_td_rf, "Tipo"] = "Tesouro Direto"
+    
+    # Consolida
+    consolidado = pd.concat([df_acoes_pad, df_rf_pad], ignore_index=True)
+    
+    # Remove linhas com valores nulos ou inválidos
+    consolidado = consolidado.dropna(subset=["Produto", "Valor"])
+    consolidado = consolidado[consolidado["Valor"] > 0]
+
+    return consolidado[["Produto", "Código", "Quantidade Disponível", "Preço", "Valor", "Tipo", "Usuário", "Mês/Ano"]]
+
+def padronizar_dividendos(df_proventos: pd.DataFrame) -> pd.DataFrame:
+    """
+    Padroniza DataFrame de Proventos/Dividendos para colunas:
+    Data, Ativo, Valor Bruto, Impostos, Valor Líquido, Fonte
+    
+    Se não houver coluna de Valor Bruto ou Impostos, calcula com base no Valor Líquido.
+    """
+    if df_proventos.empty:
+        return pd.DataFrame(columns=["Data", "Ativo", "Valor Bruto", "Impostos", "Valor Líquido", "Fonte"])
+    
+    df = df_proventos.copy()
+    
+    resultado = pd.DataFrame()
+    
+    # Data de crédito (usa Data de Pagamento ou Mês/Ano)
+    resultado["Data"] = df.get("Data de Pagamento")
+    if resultado["Data"].isna().all() and "Mês/Ano" in df.columns:
+        resultado["Data"] = df.get("Mês/Ano")
+    
+    # Ativo (extrai ticker do Produto se possível)
+    resultado["Ativo"] = df.get("Produto").apply(lambda x: str(x).split(" - ")[0] if pd.notna(x) else "")
+    
+    # Valor Bruto (se não existir, assume igual ao Valor Líquido)
+    if "Valor Bruto" in df.columns:
+        resultado["Valor Bruto"] = pd.to_numeric(df.get("Valor Bruto"), errors="coerce")
+    else:
+        resultado["Valor Bruto"] = pd.to_numeric(df.get("Valor Líquido"), errors="coerce")
+    
+    # Impostos (se não existir, assume 0)
+    if "Impostos" in df.columns:
+        resultado["Impostos"] = pd.to_numeric(df.get("Impostos"), errors="coerce").fillna(0)
+    else:
+        resultado["Impostos"] = 0.0
+    
+    # Valor Líquido
+    resultado["Valor Líquido"] = pd.to_numeric(df.get("Valor Líquido"), errors="coerce")
+    
+    # Fonte (mês/ano ou usuário + mês/ano)
+    fonte = ""
+    if "Mês/Ano" in df.columns:
+        fonte = df.get("Mês/Ano").astype(str)
+    if "Usuário" in df.columns:
+        usuario = df.get("Usuário").astype(str)
+        fonte = usuario + " (" + fonte + ")"
+    
+    resultado["Fonte"] = fonte
+    
+    # Remove linhas inválidas
+    resultado = resultado.dropna(subset=["Ativo", "Valor Líquido"])
+    resultado = resultado[resultado["Valor Líquido"] != 0]
+    
+    return resultado[["Data", "Ativo", "Valor Bruto", "Impostos", "Valor Líquido", "Fonte"]]
