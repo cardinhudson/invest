@@ -8,7 +8,6 @@ import re
 import pdfplumber
 import pandas as pd
 from typing import Dict, List
-from pathlib import Path
 
 
 class ParseadorAcoesPDFV4:
@@ -121,11 +120,8 @@ class ParseadorAcoesPDFV4:
             # Tentar importar e usar o parser V3 que já funciona bem
             from modules.upload_pdf_avenue_v3 import ParseadorAcoesPDFV3
             
-            print(f"[V4] Tentando usar V3 para {Path(pdf_path).name}")
             parser_v3 = ParseadorAcoesPDFV3("01/2025", self.usuario_nome)
             df_v3 = parser_v3.extrair_do_pdf(pdf_path)
-            
-            print(f"[V4] V3 retornou {len(df_v3)} ações")
             
             # Converter DataFrame V3 para lista de dicts V4
             if not df_v3.empty:
@@ -141,11 +137,10 @@ class ParseadorAcoesPDFV4:
                         "Usuário": self.usuario_nome
                     }
                     acoes.append(acao)
-                print(f"[V4] Converteu {len(acoes)} ações")
             
             return acoes
         except Exception as e:
-            print(f"⚠️ Parser V3 falhou: {type(e).__name__}: {e}")
+            pass  # Passe para fallback
         
         # Fallback: extração inline do formato novo
         try:
@@ -204,9 +199,7 @@ class ParseadorAcoesPDFV4:
     def extrair(self, pdf_path: str) -> List[Dict]:
         """Extrai ações detectando automaticamente o formato"""
         formato = self._detectar_formato(pdf_path)
-        print(f"[Parser V4] Formato detectado: {formato} ✅")
         
-        print(f"[V4] Chamando _extrair_formato_{formato.lower()}()")
         if formato == "ANTIGO":
             return self._extrair_formato_antigo(pdf_path)
         else:

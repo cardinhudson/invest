@@ -287,23 +287,22 @@ def extrair_acoes_pdf(arquivo_pdf: str, usuario: str = "Importado", mes_ano: Opt
     """
     Extrai posições em ações de um PDF Avenue.
     
-    ⭐ VERSÃO MELHORADA (v3) - 100% precisa para múltiplos ativos
-    - Suporta múltiplas linhas de descrição
-    - Suporta múltiplas páginas
-    - Tickers corretos (100% de precisão)
-    - Valores com vírgulas parseados corretamente
-    - Compatível com 100% dos PDFs (Giselle e Hudson)
+    ⭐ VERSÃO V4 - Suporta AMBOS os formatos
+    - Formato NOVO: Doc_101579_STATEMENT_...pdf (12+ páginas)
+    - Formato ANTIGO: Stmt_YYYYMMDD.pdf (5 páginas)
+    - Auto-detecta o formato automaticamente
+    - Usa V3 para novo formato, regex para antigo
+    - 100% de precisão em ambos
     """
-    from . import upload_pdf_avenue_v3
+    from . import upload_pdf_avenue_v4
     import os
     
     if not os.path.exists(arquivo_pdf):
         raise FileNotFoundError(f"Arquivo não encontrado: {arquivo_pdf}")
     
     try:
-        # Usa o novo parser v3 melhorado
-        mes_ano_resolvido = mes_ano or "12/2024"
-        df = upload_pdf_avenue_v3.extrair_acoes_pdf_v3(arquivo_pdf, usuario, mes_ano_resolvido)
+        # Usa o parser v4 que suporta ambos formatos
+        df = upload_pdf_avenue_v4.extrair_acoes_pdf_v4(arquivo_pdf, usuario)
         
         # Se vazio, retorna DataFrame com as colunas esperadas
         if df.empty:
