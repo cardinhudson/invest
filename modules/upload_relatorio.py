@@ -391,32 +391,51 @@ def _is_tesouro(produto: str, codigo: str) -> bool:
     return any(pat in texto for pat in ["tesouro", "ltn", "lft", "ntn", "ntnb", "ntnf", "selic", "ipca+"])
 
 
+def _is_opcao(produto: str, codigo: str) -> bool:
+    """Detecta se é uma opção de compra ou venda"""
+    texto = " ".join([
+        str(produto or ""),
+        str(codigo or ""),
+    ]).lower()
+    return any(pat in texto for pat in ["opção de compra", "opcao de compra", "opção de venda", "opcao de venda", "opção", "opcao"])
+
+
 def padronizar_tabelas(df_acoes: pd.DataFrame, df_renda_fixa: pd.DataFrame) -> pd.DataFrame:
     """
     Consolida Ações e Renda Fixa em um único DataFrame com colunas padronizadas.
-    Retorna um DataFrame com colunas: Produto, Código, Quantidade Disponível, Preço, Valor, Tipo
+    Retorna um DataFrame com colunas: Ativo, Ticker, Quantidade Disponível, Preço, Valor, Tipo
     """
     df_acoes_pad = padronizar_acoes(df_acoes) if not df_acoes.empty else pd.DataFrame()
     df_rf_pad = padronizar_renda_fixa(df_renda_fixa) if not df_renda_fixa.empty else pd.DataFrame()
     
+    # Renomear Produto→Ativo e Código→Ticker para padronização
+    if not df_acoes_pad.empty:
+        df_acoes_pad = df_acoes_pad.rename(columns={"Produto": "Ativo", "Código": "Ticker"})
+    if not df_rf_pad.empty:
+        df_rf_pad = df_rf_pad.rename(columns={"Produto": "Ativo", "Código": "Ticker"})
+    
     # Adiciona coluna de tipo
     if not df_acoes_pad.empty:
         df_acoes_pad["Tipo"] = "Ações"
-        mask_td_acoes = df_acoes_pad.apply(lambda r: _is_tesouro(r.get("Produto"), r.get("Código")), axis=1)
+        # Classificar opções primeiro
+        mask_opcao = df_acoes_pad.apply(lambda r: _is_opcao(r.get("Ativo"), r.get("Ticker")), axis=1)
+        df_acoes_pad.loc[mask_opcao, "Tipo"] = "Opções"
+        # Depois classificar tesouro direto
+        mask_td_acoes = df_acoes_pad.apply(lambda r: _is_tesouro(r.get("Ativo"), r.get("Ticker")), axis=1)
         df_acoes_pad.loc[mask_td_acoes, "Tipo"] = "Tesouro Direto"
     if not df_rf_pad.empty:
         df_rf_pad["Tipo"] = "Renda Fixa"
-        mask_td_rf = df_rf_pad.apply(lambda r: _is_tesouro(r.get("Produto"), r.get("Código")), axis=1)
+        mask_td_rf = df_rf_pad.apply(lambda r: _is_tesouro(r.get("Ativo"), r.get("Ticker")), axis=1)
         df_rf_pad.loc[mask_td_rf, "Tipo"] = "Tesouro Direto"
     
     # Consolida
     consolidado = pd.concat([df_acoes_pad, df_rf_pad], ignore_index=True)
     
     # Remove linhas com valores nulos ou inválidos
-    consolidado = consolidado.dropna(subset=["Produto", "Valor"])
+    consolidado = consolidado.dropna(subset=["Ativo", "Valor"])
     consolidado = consolidado[consolidado["Valor"] > 0]
 
-    return consolidado[["Produto", "Código", "Quantidade Disponível", "Preço", "Valor", "Tipo", "Usuário", "Mês/Ano"]]
+    return consolidado[["Ativo", "Ticker", "Quantidade Disponível", "Preço", "Valor", "Tipo", "Usuário", "Mês/Ano"]]
 
 def padronizar_dividendos(df_proventos: pd.DataFrame) -> pd.DataFrame:
     """
@@ -454,6 +473,18 @@ def padronizar_dividendos(df_proventos: pd.DataFrame) -> pd.DataFrame:
     
     # Valor Líquido
     resultado["Valor Líquido"] = pd.to_numeric(df.get("Valor Líquido"), errors="coerce")
+    
+    # Usuário
+    if "Usuário" in df.columns:
+        resultado["Usuário"] = df.get("Usuário")
+    else:
+        resultado["Usuário"] = None
+    
+    # Mês/Ano
+    if "Mês/Ano" in df.columns:
+        resultado["Mês/Ano"] = df.get("Mês/Ano")
+    else:
+        resultado["Mês/Ano"] = None
     
     # Fonte (mês/ano ou usuário + mês/ano)
     fonte = ""

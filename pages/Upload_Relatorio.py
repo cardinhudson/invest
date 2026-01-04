@@ -3,12 +3,13 @@ st.set_page_config(layout="wide")
 import pandas as pd
 import os
 import importlib
-import tempfile
 import modules.upload_relatorio as ur
 from modules.usuarios import carregar_usuarios
 from modules.upload_pdf_avenue import (
     processar_pdf_individual, processar_pasta_pdfs, processar_pdfs_usuario,
     salvar_acoes_pdf_parquet, salvar_dividendos_pdf_parquet,
+    inferir_mes_ano_pdf_ou_nome, inferir_usuario_pdf,
+    salvar_pdf_relatorio_upload, salvar_pdf_relatorio_path,
     ACOES_PDF_PATH, DIVIDENDOS_PDF_PATH
 )
 import datetime
@@ -38,6 +39,12 @@ with tab_excel:
     with st.expander("📂 Processar pasta inteira de relatórios"):
         pasta_base = st.text_input("Pasta base", value="C:\\GIT\\invest\\Relatorios")
         usar_subpasta_usuario = st.checkbox("Usar nome da subpasta como usuário", value=True)
+        sobrescrever_lote = st.checkbox(
+            "Sobrescrever dados existentes",
+            value=True,
+            help="Se desmarcado, arquivos com dados já processados (mesmo usuário e mês/ano) serão ignorados",
+            key="excel_overwrite_lote",
+        )
         usuario_lote = st.selectbox(
             "Usuário padrão (caso não use subpasta)",
             sorted(carregar_usuarios()["Nome"].unique()) if not carregar_usuarios().empty else [],
@@ -53,6 +60,7 @@ with tab_excel:
                 total_a = total_rf = total_p = 0
                 skip_sem_mes = []
                 skip_sem_usuario = []
+                skip_ja_processado = []
                 arquivos = []
                 for raiz, _dirs, files in os.walk(pasta_base):
                     for f in files:
@@ -76,6 +84,21 @@ with tab_excel:
                             skip_sem_mes.append(caminho)
                             progress.progress(i / len(arquivos))
                             continue
+                        
+                        # Verificar se já existe e não deve sobrescrever
+                        if not sobrescrever_lote:
+                            ja_existe = False
+                            if os.path.exists(ACOES_PATH):
+                                df_check = pd.read_parquet(ACOES_PATH)
+                                ja_existe = not df_check[
+                                    (df_check["Mês/Ano"] == mes_ano) & 
+                                    (df_check["Usuário"] == user_atual)
+                                ].empty
+                            if ja_existe:
+                                skip_ja_processado.append(caminho)
+                                progress.progress(i / len(arquivos))
+                                continue
+                        
                         try:
                             df_acoes, df_rf, df_prov = ler_relatorio_excel(caminho, user_atual, mes_ano)
                             salvar_arquivo_upload_path(caminho, user_atual, mes_ano)
@@ -114,6 +137,9 @@ with tab_excel:
                     if skip_sem_usuario:
                         st.warning(f"Arquivos ignorados por falta de usuário: {len(skip_sem_usuario)}")
                         st.caption("\n".join(skip_sem_usuario))
+                    if skip_ja_processado:
+                        st.info(f"Arquivos já processados (ignorados): {len(skip_ja_processado)}")
+                        st.caption("\n".join(skip_ja_processado))
 
     # Visualizar histórico existente
     with st.expander("📈 Consultar histórico (sem novo upload)"):
@@ -393,8 +419,17 @@ with tab_pdf:
     
     # Processar pasta inteira de PDFs
     with st.expander("📂 Processar pasta inteira de PDFs"):
-        pasta_base_pdf = st.text_input("Pasta base", value=r"C:\Users\hudso\Downloads\Statements", key="pdf_pasta_base")
+        pasta_base_pdf = st.text_input(
+            "Pasta base",
+            value=r"C:\GIT\invest\Relatorios\Avenue",
+            key="pdf_pasta_base",
+        )
         usar_subpasta_usuario_pdf = st.checkbox("Usar nome da subpasta como usuário", value=True, key="pdf_use_subpasta")
+        sobrescrever_lote_pdf = st.checkbox(
+            "Sobrescrever PDFs já existentes em Relatorios/Avenue",
+            value=False,
+            key="pdf_overwrite_lote",
+        )
         usuario_lote_pdf = st.selectbox(
             "Usuário padrão (caso não use subpasta)",
             sorted(df_usuarios["Nome"].unique()) if not df_usuarios.empty else ["Importado"],
@@ -429,7 +464,16 @@ with tab_pdf:
                             progress.progress(i / len(arquivos))
                             continue
                         try:
-                            df_acoes_pdf, df_divid_pdf = processar_pdf_individual(caminho, usuario=user_atual, mes_ano=None)
+                            destino_pdf, status_save = salvar_pdf_relatorio_path(
+                                caminho,
+                                overwrite=sobrescrever_lote_pdf,
+                                usuario=user_atual,
+                            )
+                            if status_save == "skipped_exists" or not destino_pdf:
+                                progress.progress(i / len(arquivos))
+                                continue
+
+                            df_acoes_pdf, df_divid_pdf = processar_pdf_individual(destino_pdf, usuario=user_atual, mes_ano=None)
                             
                             if not df_acoes_pdf.empty:
                                 salvar_acoes_pdf_parquet(df_acoes_pdf, ACOES_PDF_PATH)
@@ -486,11 +530,12 @@ with tab_pdf:
         col1, col2 = st.columns(2)
         
         with col1:
+            usuarios_opcoes = ["Auto-detectar"] + (sorted(df_usuarios["Nome"].unique()) if not df_usuarios.empty else ["Importado"])
             usuario_pdf = st.selectbox(
-                "👤 Usuário/Dono do PDF",
-                sorted(df_usuarios["Nome"].unique()) if not df_usuarios.empty else ["Importado"],
-                help="Selecione o usuário responsável pelo PDF",
-                key="pdf_user_form"
+                "👤 Usuário",
+                usuarios_opcoes,
+                help="Deixe em Auto-detectar para inferir pelo nome do arquivo.",
+                key="pdf_user_form",
             )
         
         with col2:
@@ -505,6 +550,13 @@ with tab_pdf:
                 help="Selecione o período ou deixe auto-detectar",
                 key="pdf_mes_form"
             )
+
+        sobrescrever_pdf = st.checkbox(
+            "Sobrescrever PDF existente em Relatorios/Avenue",
+            value=False,
+            help="Se desmarcado, um PDF com o mesmo nome será ignorado.",
+            key="pdf_overwrite_single",
+        )
         
         st.subheader("2️⃣ Arquivo PDF")
         arquivo_pdf = st.file_uploader(
@@ -521,22 +573,50 @@ with tab_pdf:
     if processar_pdf:
         if not arquivo_pdf:
             st.error("❌ Por favor, selecione um arquivo PDF!")
-        elif not usuario_pdf:
-            st.error("❌ Por favor, selecione um usuário!")
         else:
             with st.spinner("⏳ Processando PDF..."):
                 try:
-                    # Salvar arquivo temporário
-                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                        tmp.write(arquivo_pdf.getbuffer())
-                        tmp_path = tmp.name
-                    
+                    nome_original = arquivo_pdf.name
+
+                    # Detectar mês/ano
+                    mes_processamento = None
+                    if mes_ano_pdf != "Auto-detectar":
+                        mes_processamento = mes_ano_pdf
+                    else:
+                        mes_processamento = inferir_mes_ano_pdf_ou_nome(nome_original)
+
+                    # Detectar usuário
+                    usuario_processamento = None
+                    if usuario_pdf != "Auto-detectar":
+                        usuario_processamento = usuario_pdf
+                    else:
+                        usuario_processamento = inferir_usuario_pdf(nome_original)
+
+                    if not usuario_processamento:
+                        st.error("❌ Não foi possível identificar o usuário automaticamente pelo nome do arquivo.")
+                        st.info("💡 Dica: inclua o nome do usuário no nome do PDF (ex.: 'Hudson_Stmt_20251130.pdf') ou selecione manualmente.")
+                        raise ValueError("Usuário não identificado")
+
+                    if not mes_processamento:
+                        st.error("❌ Não foi possível identificar o mês/ano automaticamente pelo nome do arquivo.")
+                        st.info("💡 Dica: use nomes como 'Stmt_YYYYMMDD.pdf' (Avenue) ou inclua MM-AAAA no nome.")
+                        raise ValueError("Mês/Ano não identificado")
+
+                    # Salvar em Relatorios/Avenue com opção de sobrescrever
+                    destino_pdf, status_save = salvar_pdf_relatorio_upload(
+                        arquivo_pdf,
+                        overwrite=sobrescrever_pdf,
+                        usuario=usuario_processamento,
+                    )
+                    if status_save == "skipped_exists" or not destino_pdf:
+                        st.warning("⚠️ PDF já existe em Relatorios/Avenue e a opção de sobrescrever está desmarcada. Nenhuma ação foi feita.")
+                        st.stop()
+
                     # Processar
-                    mes_processamento = None if mes_ano_pdf == "Auto-detectar" else mes_ano_pdf
                     df_acoes_pdf, df_divid_pdf = processar_pdf_individual(
-                        tmp_path,
-                        usuario=usuario_pdf,
-                        mes_ano=mes_processamento
+                        destino_pdf,
+                        usuario=usuario_processamento,
+                        mes_ano=mes_processamento,
                     )
                     
                     st.markdown("---")
@@ -583,12 +663,6 @@ with tab_pdf:
                     else:
                         st.error("❌ Nenhum dado foi encontrado no arquivo PDF.")
                     
-                    # Limpar arquivo temporário
-                    try:
-                        os.remove(tmp_path)
-                    except:
-                        pass
-                
                 except Exception as e:
                     st.error(f"❌ Erro ao processar o arquivo: {str(e)}")
                     st.exception(e)
