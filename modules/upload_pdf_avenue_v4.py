@@ -206,6 +206,7 @@ class ParseadorAcoesPDFV4:
         formato = self._detectar_formato(pdf_path)
         print(f"[Parser V4] Formato detectado: {formato} ✅")
         
+        print(f"[V4] Chamando _extrair_formato_{formato.lower()}()")
         if formato == "ANTIGO":
             return self._extrair_formato_antigo(pdf_path)
         else:
