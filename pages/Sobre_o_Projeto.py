@@ -127,7 +127,9 @@ if indice_selecionado == "🏠 Visão Geral":
     - **📈 Ações**: Ações BR, Ações Dólar (Avenue) e Ações Consolidadas (BR + Avenue).
     - **💵 Renda Fixa**: Renda Fixa, Tesouro Direto e Renda Fixa Consolidada.
     - **💸 Proventos**: Dividendos BR, Dividendos Avenue e Dividendos Consolidados.
-    - **📊 Consolidação**: Visão única com todos os investimentos combinados (BR + Avenue) com filtros, métricas e gráficos de distribuição.
+    - **📊 Consolidação**: Visão única com todos os investimentos combinados (BR + Avenue) com:
+        - **Investimento**: Filtros, métricas e gráficos de distribuição por tipo, setor e ativo.
+        - **Rentabilidade**: Análise mensal de retorno por ativo usando quantidade do mês anterior (metodologia "sem aportes").
     - **⚙️ Outros**: Cadastro de usuários e Inserção Manual.
     """)
     
@@ -575,6 +577,51 @@ elif tem_upload_relatorio and indice_selecionado == "📥 Upload de Relatórios"
     st.markdown("""
     Esta seção é dedicada ao upload e processamento de relatórios mensais de investimentos
     da B3 e corretoras.
+    """)
+    
+    st.markdown("---")
+    
+    st.subheader("🔢 Cálculo de Rentabilidade Mensal")
+    
+    st.markdown("""
+    A aba de **Rentabilidade** dentro de **Consolidação** calcula o retorno mensal de cada ativo
+    usando a metodologia "sem aportes", que considera apenas a variação de preço e dividendos
+    sobre a quantidade **do mês anterior**.
+    
+    **Fórmula Aplicada (Linha a Linha):**
+    ```
+    Para cada Ativo no Mês:
+        1. QuantidadeBase = Quantidade do Mês Anterior
+        2. ValorInicial = QuantidadeBase × Preço do Mês Anterior
+        3. ValorFinal = QuantidadeBase × Preço do Mês Atual
+        4. Dividendos = Soma total de dividendos recebidos do ativo no mês
+        5. Retorno% = ((ValorFinal + Dividendos) - ValorInicial) / ValorInicial × 100
+    ```
+    
+    **Exemplo Prático (SAPR4 - Giselle - 06/2024):**
+    - Quantidade em 05/2024: **14 ações**
+    - Preço em 05/2024: **R$ 5,59**
+    - Preço em 06/2024: **R$ 5,59**
+    - Dividendos recebidos em 06/2024: **R$ 396,50**
+    
+    **Cálculo:**
+    ```
+    ValorInicial = 14 × 5,59 = R$ 78,26
+    ValorFinal = 14 × 5,59 = R$ 78,26
+    Retorno% = ((78,26 + 396,50) - 78,26) / 78,26 × 100 = 506,64%
+    ```
+    
+    O retorno de **506%** reflete o impacto dos dividendos (R$ 396,50) sobre uma base pequena
+    (14 ações = R$ 78,26). Isso ocorre quando há dividendos de posições maiores em outras instituições,
+    mas a posição de fim de mês registrada é menor.
+    
+    **Agregações Maiores (Trimestral, Anual):**
+    - Para períodos maiores, o retorno é calculado usando **juros compostos** (produto dos fatores mensais).
+    - Fórmula: `RetornoTotal = [(1 + R1/100) × (1 + R2/100) × ... - 1] × 100`
+    
+    **Persistência e Cache:**
+    - A base de rentabilidade é salva em `data/rentabilidade_base.parquet` para performance.
+    - Rebuild automático quando há mudança nos arquivos de posições ou proventos.
     """)
     
     st.markdown("---")
