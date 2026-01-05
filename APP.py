@@ -1,22 +1,41 @@
 import os
+import json
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import numpy as np
+from modules.ticker_info import CACHE_PATH as TICKER_INFO_PATH
 
 from modules.usuarios import carregar_usuarios, salvar_usuarios
 from modules.upload_relatorio import ACOES_PATH, RENDA_FIXA_PATH, PROVENTOS_PATH, padronizar_tabelas, padronizar_dividendos
 from modules.avenue_views import aba_acoes_avenue, aba_proventos_avenue, padronizar_dividendos_avenue, carregar_dividendos_avenue, padronizar_acoes_avenue, carregar_acoes_avenue
 from modules.cotacoes import converter_usd_para_brl
 
+@st.cache_data(show_spinner=False)
+def carregar_cache_ticker_info():
+    if os.path.exists(TICKER_INFO_PATH):
+        try:
+            df = pd.read_parquet(TICKER_INFO_PATH)
+            if not df.empty and "Ticker" in df.columns:
+                return df
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
 st.set_page_config(page_title="Invest - Controle de Investimentos", layout="wide")
 st.title("💰 Invest - Controle de Investimentos")
 
 # ========== FUNÇÕES AUXILIARES ==========
 
+@st.cache_data(show_spinner=False)
+def _read_parquet_cached(path: str, mtime: float):
+    return pd.read_parquet(path)
+
 def carregar_df_parquet(path):
     if os.path.exists(path):
         try:
-            return pd.read_parquet(path)
+            mtime = os.path.getmtime(path)
+            return _read_parquet_cached(path, mtime)
         except Exception:
             return pd.DataFrame()
     else:
@@ -87,36 +106,97 @@ def gerar_graficos_distribuicao(df, col_valor="Valor", cores="Blues", key_prefix
     st.markdown("---")
     st.subheader("📊 Distribuição")
     
-    # Pizza por tipo
-    dist_tipo = df.groupby("Tipo")[col_valor].sum()
-    fig_pie = px.pie(
-        names=dist_tipo.index,
-        values=dist_tipo.values,
-        title="Distribuição por Tipo",
-        hole=0.3,
-        color_discrete_sequence=getattr(px.colors.sequential, cores),
-        labels={"names": "Tipo", "values": "Valor"}
-    )
-    fig_pie.update_traces(
-        textinfo="label+percent+value",
-        texttemplate="%{label}<br>R$%{value:,.2f} (%{percent})"
-    )
-    st.plotly_chart(fig_pie, use_container_width=True, key=f"{key_prefixo}_pie")
+
+    col_pie1, col_pie2 = st.columns(2)
+
+    with col_pie1:
+        st.markdown("<div style='display:flex;align-items:center;gap:0.5em;'><h5 style='margin-bottom:0;margin-top:0;'>Distribuição por Tipo</h5></div>", unsafe_allow_html=True)
+        dist_tipo = df.groupby("Tipo")[col_valor].sum()
+        fig_pie = px.pie(
+            names=dist_tipo.index,
+            values=dist_tipo.values,
+            hole=0.3,
+            color_discrete_sequence=getattr(px.colors.sequential, cores),
+            labels={"names": "Tipo", "values": "Valor"}
+        )
+        fig_pie.update_traces(
+            textinfo="label+percent+value",
+            texttemplate="%{label}<br>R$%{value:,.2f} (%{percent})"
+        )
+        fig_pie.update_layout(
+            legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
+        )
+        st.plotly_chart(fig_pie, use_container_width=True, key=f"{key_prefixo}_pie")
+
+    with col_pie2:
+        opcoes_dim = []
+        if "Setor" in df.columns:
+            opcoes_dim.append("Setor")
+        if "Segmento" in df.columns:
+            opcoes_dim.append("Segmento")
+        if opcoes_dim:
+            col_tit, col_filtro = st.columns([2,2])
+            with col_tit:
+                st.markdown("<div style='display:flex;align-items:center;gap:0.5em;'><h5 style='margin-bottom:0;margin-top:0;'>Distribuição por</h5></div>", unsafe_allow_html=True)
+            with col_filtro:
+                dim_sel = st.radio("", opcoes_dim, horizontal=True, key=f"{key_prefixo}_dim")
+            dist_dim = df.groupby(dim_sel)[col_valor].sum()
+            dist_dim = dist_dim[dist_dim > 0]
+            if not dist_dim.empty:
+                fig_pie_dim = px.pie(
+                    names=dist_dim.index,
+                    values=dist_dim.values,
+                    hole=0.3,
+                    labels={"names": dim_sel, "values": "Valor"}
+                )
+                fig_pie_dim.update_layout(
+                    legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
+                    margin=dict(t=40)
+                )
+                fig_pie_dim.update_traces(textinfo="label+percent", texttemplate="%{label}<br>%{percent}")
+                st.plotly_chart(fig_pie_dim, use_container_width=True, key=f"{key_prefixo}_pie_dim")
+            else:
+                st.info(f"Sem dados para {dim_sel}.")
     
     # Barras top ativos
-    if "Ativo" in df.columns:
-        top_n = 10
-        top_ativos = df.groupby("Ativo")[col_valor].sum().nlargest(top_n).sort_values(ascending=False)
+    eixo_categoria = "Ticker" if "Ticker" in df.columns else "Ativo"
+    eixo_hover = "Ativo" if "Ativo" in df.columns else eixo_categoria
+
+    if eixo_categoria in df.columns:
+        opcoes_top_dist = ["Top 10", "Top 15", "Top 20", "Top 30", "Todos"]
+        top_sel_dist = st.selectbox(f"Quantidade ({eixo_categoria})", opcoes_top_dist, index=0, key=f"{key_prefixo}_top_dist")
+        top_n = int(top_sel_dist.split()[1]) if top_sel_dist != "Todos" else None
+        
+        top_ativos = df.groupby(eixo_categoria)[col_valor].sum().sort_values(ascending=False)
+        if top_n:
+            top_ativos = top_ativos.head(top_n)
+        
         if not top_ativos.empty:
-            st.subheader(f"🏆 Top {top_n} Ativos")
+            titulo_dist = f"Top {top_n}" if top_n else "Todos"
+            st.subheader(f"🏆 {titulo_dist} {eixo_categoria}")
+            max_val = top_ativos.values.max() if len(top_ativos.values) else 0
+            tickers_x = [extrair_ticker(a) or str(a) for a in top_ativos.index] if eixo_categoria == "Ativo" else list(top_ativos.index)
+            from plotly.colors import sample_colorscale
+            blues = px.colors.sequential.Blues[::-1]  # maior = azul escuro
+            n = len(top_ativos)
+            bar_colors = sample_colorscale(blues, [i/(n-1) if n>1 else 0 for i in range(n)])
             fig_bar = px.bar(
-                x=top_ativos.index,
+                x=tickers_x,
                 y=top_ativos.values,
-                labels={"x": "Ativo", "y": "Valor (R$)"},
-                text=[f"R$ {v:,.2f}" for v in top_ativos.values]
+                labels={"x": eixo_categoria, "y": "Valor (R$)"},
+                text=[f"R$ {v:,.2f}" for v in top_ativos.values],
+                color_discrete_sequence=bar_colors
             )
-            fig_bar.update_traces(textposition="outside")
-            fig_bar.update_layout(yaxis_tickformat=",.2f")
+            fig_bar.update_traces(
+                textposition="outside",
+                cliponaxis=False,
+                customdata=list(top_ativos.index),
+                hovertemplate=f"<b>%{{customdata}}</b><br>{eixo_categoria}: %{{x}}<br>Valor: R$ %{{y:,.2f}}<extra></extra>",
+                marker_color=bar_colors
+            )
+            fig_bar.update_layout(yaxis_tickformat=",.2f", margin=dict(t=60))
+            if max_val > 0:
+                fig_bar.update_yaxes(range=[0, max_val * 1.15])
             st.plotly_chart(fig_bar, use_container_width=True, key=f"{key_prefixo}_bar")
 
 def gerar_graficos_evolucao(df: pd.DataFrame, coluna_valor: str = "Valor Líquido", coluna_data: str = "Data", chave_periodo: str = "periodo"):
@@ -176,14 +256,22 @@ def gerar_graficos_evolucao(df: pd.DataFrame, coluna_valor: str = "Valor Líquid
 
         # Gráfico de barras
         st.subheader("Gráfico de Barras - Valor Recebido")
+        max_val = df_group.values.max() if len(df_group.values) else 0
+        from plotly.colors import sample_colorscale
+        blues = px.colors.sequential.Blues[::-1]
+        n = len(df_group)
+        bar_colors = sample_colorscale(blues, [i/(n-1) if n>1 else 0 for i in range(n)])
         fig_bar = px.bar(
             x=df_group.index,
             y=df_group.values,
             labels={"x": "Período", "y": coluna_valor},
-            text=[f"{v:,.2f}" for v in df_group.values]
+            text=[f"{v:,.2f}" for v in df_group.values],
+            color_discrete_sequence=bar_colors
         )
-        fig_bar.update_traces(textposition="outside")
-        fig_bar.update_layout(yaxis_tickformat=",.2f", xaxis_tickmode="array", xaxis_tickvals=list(df_group.index), xaxis_ticktext=list(df_group.index))
+        fig_bar.update_traces(textposition="outside", cliponaxis=False, marker_color=bar_colors)
+        fig_bar.update_layout(yaxis_tickformat=",.2f", xaxis_tickmode="array", xaxis_tickvals=list(df_group.index), xaxis_ticktext=list(df_group.index), margin=dict(t=60))
+        if max_val > 0:
+            fig_bar.update_yaxes(range=[0, max_val * 1.15])
         st.plotly_chart(fig_bar, use_container_width=True, key=f"{chave_periodo}_bar")
 
         # Gráfico de linha
@@ -247,25 +335,44 @@ def gerar_grafico_top_pagadores(df: pd.DataFrame, coluna_ativo: str = "Ativo", c
                 df_filtrado = df
     
     with col_top:
-        opcoes_top = ["Top 5", "Top 10", "Top 15", "Top 20", "Top 25"]
-        top_sel = st.selectbox("Quantidade", opcoes_top, index=1, key=f"{chave_prefixo}_quantidade")
-        top_num = int(top_sel.split()[1])
+        opcoes_top = ["Top 10", "Top 15", "Top 20", "Top 30", "Todos"]
+        top_sel = st.selectbox("Quantidade", opcoes_top, index=0, key=f"{chave_prefixo}_quantidade")
+        top_num = int(top_sel.split()[1]) if top_sel != "Todos" else None
     
     try:
-        top_ativos = df_filtrado.groupby(coluna_ativo)[coluna_valor].sum().sort_values(ascending=False).head(top_num)
+        eixo_categoria = "Ticker" if "Ticker" in df_filtrado.columns else coluna_ativo
+        top_ativos = df_filtrado.groupby(eixo_categoria)[coluna_valor].sum().sort_values(ascending=False)
+        if top_num:
+            top_ativos = top_ativos.head(top_num)
 
-        st.subheader(f"Top {top_num} Maiores Pagadores - {tipo_periodo}")
+        titulo_top = f"Top {top_num}" if top_num else "Todos"
+        st.subheader(f"{titulo_top} Maiores Pagadores - {tipo_periodo}")
+        max_val = top_ativos.values.max() if len(top_ativos.values) else 0
+        tickers_x = list(top_ativos.index)
+        from plotly.colors import sample_colorscale
+        blues = px.colors.sequential.Blues[::-1]
+        n = len(top_ativos)
+        bar_colors = sample_colorscale(blues, [i/(n-1) if n>1 else 0 for i in range(n)])
         fig_top = px.bar(
-            x=top_ativos.index,
+            x=tickers_x,
             y=top_ativos.values,
-            labels={"x": coluna_ativo, "y": coluna_valor},
-            text=[f"{v:,.2f}" for v in top_ativos.values]
+            labels={"x": eixo_categoria, "y": coluna_valor},
+            text=[f"{v:,.2f}" for v in top_ativos.values],
+            color_discrete_sequence=bar_colors
         )
-        fig_top.update_traces(textposition="outside")
-        fig_top.update_layout(yaxis_tickformat=",.2f")
+        fig_top.update_traces(
+            textposition="outside",
+            cliponaxis=False,
+            customdata=list(top_ativos.index),
+            hovertemplate=f"<b>%{{customdata}}</b><br>{eixo_categoria}: %{{x}}<br>Valor: %{{y:,.2f}}<extra></extra>",
+            marker_color=bar_colors
+        )
+        fig_top.update_layout(yaxis_tickformat=",.2f", margin=dict(t=60))
+        if max_val > 0:
+            fig_top.update_yaxes(range=[0, max_val * 1.15])
         st.plotly_chart(fig_top, use_container_width=True, key=f"{chave_prefixo}_bar")
 
-        st.subheader(f"Detalhes - Top {top_num}")
+        st.subheader(f"Detalhes - {titulo_top}")
         df_top_table = pd.DataFrame({
             "Ativo": top_ativos.index,
             "Valor Total": [f"{v:,.2f}" for v in top_ativos.values]
@@ -361,6 +468,94 @@ def preparar_dividendos_consolidado(df, fonte_nome):
     
     return df
 
+
+def extrair_ticker(valor):
+    """Extrai um ticker curto de strings do tipo 'BBAS3 - Banco do Brasil'."""
+    if pd.isna(valor):
+        return None
+    texto = str(valor).strip()
+    if not texto:
+        return None
+    if " - " in texto:
+        return texto.split(" - ", 1)[0].strip()
+    return texto.split()[0].strip()
+
+
+def ticker_para_yf(ticker):
+    """Normaliza ticker para o formato aceito pelo yfinance."""
+    if not ticker:
+        return None
+    t = str(ticker).strip().upper()
+    if "." in t:
+        return t
+    if t[-1:].isdigit():  # convenção B3
+        return f"{t}.SA"
+    return t
+
+
+@st.cache_data(show_spinner=False)
+def exibir_tabela_info_tickers(df, titulo="📄 Ticker / Setor / Fundamentais (yfinance)"):
+    """Exibe tabela com tickers padronizados e informações de setor/fundamentos via yfinance."""
+    if df.empty:
+        return
+
+    tickers = []
+    if "Ticker" in df.columns:
+        tickers = df["Ticker"].dropna().astype(str).str.strip().unique().tolist()
+    elif "Ativo" in df.columns:
+        tickers = df["Ativo"].dropna().astype(str).apply(extrair_ticker).dropna().unique().tolist()
+    tickers = sorted({t for t in tickers if t})
+    if not tickers:
+        return
+
+    cache_df = carregar_cache_ticker_info()
+    if cache_df.empty:
+        return
+
+    base = pd.DataFrame({"Ticker": tickers})
+    cols = [c for c in ["Ticker", "Setor", "Segmento", "Ticker_YF", "QuoteType"] if c in cache_df.columns]
+    out = base.merge(cache_df[cols], on="Ticker", how="left")
+    st.subheader(titulo)
+    st.dataframe(out, use_container_width=True, hide_index=True)
+
+
+def enriquecer_com_setor_segmento(df):
+    """Adiciona colunas Setor e Segmento a partir do cache local (parquet)."""
+    if df.empty:
+        return df
+
+    df_work = df.copy()
+    if "Ticker" not in df_work.columns:
+        if "Ativo" in df_work.columns:
+            df_work["Ticker"] = df_work["Ativo"].apply(extrair_ticker)
+        else:
+            if "Tipo" in df_work.columns:
+                df_work["Setor"] = df_work.get("Setor", df_work["Tipo"])
+                df_work["Segmento"] = df_work.get("Segmento", df_work["Tipo"])
+            return df_work
+
+    tickers_curto = df_work["Ticker"].dropna().astype(str).str.strip().unique().tolist()
+    tickers_curto = sorted({t for t in tickers_curto if t})
+    if not tickers_curto:
+        df_out = df_work.copy()
+        df_out["Setor"] = df_out.get("Setor", df_out.get("Tipo"))
+        df_out["Segmento"] = df_out.get("Segmento", df_out.get("Tipo"))
+        return df_out
+
+    cache_df = carregar_cache_ticker_info()
+    cache_map = cache_df.set_index("Ticker").to_dict(orient="index") if (not cache_df.empty and "Ticker" in cache_df.columns) else {}
+
+    df_out = df_work.copy()
+    df_out["Setor"] = df_out.get("Setor") if "Setor" in df_out.columns else df_out["Ticker"].map(lambda t: cache_map.get(str(t).strip(), {}).get("Setor"))
+    df_out["Segmento"] = df_out.get("Segmento") if "Segmento" in df_out.columns else df_out["Ticker"].map(lambda t: cache_map.get(str(t).strip(), {}).get("Segmento"))
+
+    # Preencher vazios (inclui renda fixa) com o próprio Tipo para não ficar em branco
+    if "Tipo" in df_out.columns:
+        df_out["Setor"] = df_out["Setor"].fillna(df_out["Tipo"])
+        df_out["Segmento"] = df_out["Segmento"].fillna(df_out["Tipo"])
+
+    return df_out
+
 df_dividendos_br_cons = preparar_dividendos_consolidado(df_dividendos_br, "Proventos Gerais")
 df_dividendos_avenue_cons = preparar_dividendos_consolidado(df_dividendos_avenue, "Proventos Avenue")
 df_dividendos_consolidado = pd.concat([df_dividendos_br_cons, df_dividendos_avenue_cons], ignore_index=True)
@@ -372,10 +567,11 @@ df_tesouro = df_padronizado[df_padronizado["Tipo"] == "Tesouro Direto"].copy() i
 
 # ========== INTERFACE COM TABS REORGANIZADAS ==========
 
-tab_acoes, tab_renda_fixa, tab_proventos, tab_outros = st.tabs([
+tab_acoes, tab_renda_fixa, tab_proventos, tab_consolidacao, tab_outros = st.tabs([
     "📈 Ações",
     "💵 Renda Fixa",
     "💸 Proventos",
+    "📊 Consolidação",
     "⚙️ Outros"
 ])
 
@@ -395,6 +591,7 @@ with tab_acoes:
             st.info("Sem dados de Ações Brasil")
         else:
             df_view = aplicar_filtros_padrao(df_acoes_br, "acoes_br")
+            df_view = enriquecer_com_setor_segmento(df_view)
             exibir_metricas_valor(df_view)
             
             with st.expander("📋 Ver Tabela Completa", expanded=False):
@@ -427,6 +624,7 @@ with tab_acoes:
             st.info("Sem dados de Ações")
         else:
             df_view = aplicar_filtros_padrao(df_acoes_todas, "acoes_cons")
+            df_view = enriquecer_com_setor_segmento(df_view)
             exibir_metricas_valor(df_view)
             
             with st.expander("📋 Ver Tabela Completa", expanded=False):
@@ -450,6 +648,7 @@ with tab_renda_fixa:
             st.info("Sem dados de Renda Fixa")
         else:
             df_view = aplicar_filtros_padrao(df_renda_fixa, "rf")
+            df_view = enriquecer_com_setor_segmento(df_view)
             exibir_metricas_valor(df_view)
             
             with st.expander("📋 Ver Tabela Completa", expanded=False):
@@ -465,6 +664,7 @@ with tab_renda_fixa:
             st.info("Sem dados de Tesouro Direto")
         else:
             df_view = aplicar_filtros_padrao(df_tesouro, "td")
+            df_view = enriquecer_com_setor_segmento(df_view)
             exibir_metricas_valor(df_view)
             
             with st.expander("📋 Ver Tabela Completa", expanded=False):
@@ -489,6 +689,7 @@ with tab_renda_fixa:
             st.info("Sem dados de Renda Fixa ou Tesouro Direto")
         else:
             df_view = aplicar_filtros_padrao(df_rf_todas, "rf_cons")
+            df_view = enriquecer_com_setor_segmento(df_view)
             exibir_metricas_valor(df_view)
             
             with st.expander("📋 Ver Tabela Completa", expanded=False):
@@ -616,6 +817,566 @@ with tab_proventos:
             # Gráfico de top pagadores
             st.markdown("---")
             gerar_grafico_top_pagadores(df_filtrado, coluna_ativo="Ativo", coluna_valor="Valor Líquido", coluna_data="Data", chave_prefixo="top_div_cons")
+
+# ============ TAB CONSOLIDAÇÃO ============
+with tab_consolidacao:
+    st.header("📊 Consolidação Geral")
+
+    subtab_investimento, subtab_rentabilidade = st.tabs([
+        "💼 Investimento",
+        "📈 Rentabilidade",
+    ])
+
+    frames_consolidados = []
+    if not df_padronizado.empty:
+        frames_consolidados.append(df_padronizado.copy())
+    if not df_acoes_avenue_padrao.empty:
+        frames_consolidados.append(df_acoes_avenue_padrao.copy())
+
+    df_consolidado_geral = pd.concat(frames_consolidados, ignore_index=True) if frames_consolidados else pd.DataFrame()
+
+    with subtab_investimento:
+        if df_consolidado_geral.empty:
+            st.info("Sem dados para consolidação.")
+        else:
+            if "Valor" not in df_consolidado_geral.columns:
+                if "Valor de Mercado" in df_consolidado_geral.columns:
+                    df_consolidado_geral["Valor"] = df_consolidado_geral["Valor de Mercado"]
+            df_view = aplicar_filtros_padrao(df_consolidado_geral, "cons_geral")
+            df_view_enriquecido = enriquecer_com_setor_segmento(df_view)
+            exibir_metricas_valor(df_view_enriquecido)
+
+            with st.expander("📋 Ver Tabela Completa", expanded=False):
+                st.dataframe(df_view_enriquecido, use_container_width=True)
+
+            gerar_graficos_distribuicao(df_view_enriquecido, cores="Purples", key_prefixo="cons_geral")
+            exibir_tabela_info_tickers(df_view_enriquecido)
+
+    with subtab_rentabilidade:
+        st.subheader("📈 Rentabilidade (sem aportes)")
+
+        RENTAB_PARQUET_PATH = "data/rentabilidade_base.parquet"
+        RENTAB_META_PATH = "data/rentabilidade_base_meta.json"
+
+        def _norm_key(valor) -> str:
+            if pd.isna(valor):
+                return ""
+            txt = str(valor).strip()
+            if not txt:
+                return ""
+            if " - " in txt:
+                txt = txt.split(" - ", 1)[0].strip()
+            return txt.upper()
+
+        def _parse_num_misto(valor):
+            """Parse numérico tolerante (pt-BR e US), sem destruir strings com milhar."""
+            if pd.isna(valor):
+                return np.nan
+            if isinstance(valor, (int, float, np.integer, np.floating)):
+                try:
+                    return float(valor)
+                except Exception:
+                    return np.nan
+            txt = str(valor).strip()
+            if not txt:
+                return np.nan
+            # remove símbolos comuns
+            txt = txt.replace("R$", "").replace("US$", "").replace("$", "")
+            txt = txt.replace("%", "").replace("\u00a0", " ")
+            txt = txt.replace(" ", "")
+            # parênteses para negativo
+            negativo = False
+            if txt.startswith("(") and txt.endswith(")"):
+                negativo = True
+                txt = txt[1:-1]
+            # sinais
+            if txt.startswith("+"):
+                txt = txt[1:]
+            elif txt.startswith("-"):
+                negativo = True
+                txt = txt[1:]
+
+            if not txt:
+                return np.nan
+
+            # Se tem "." e ",": assume pt-BR (milhar "." e decimal ",")
+            if "." in txt and "," in txt:
+                txt_norm = txt.replace(".", "").replace(",", ".")
+            # Só vírgula: assume decimal
+            elif "," in txt:
+                txt_norm = txt.replace(".", "").replace(",", ".")
+            # Só ponto: pode ser decimal ou milhar
+            elif "." in txt:
+                partes = txt.split(".")
+                # Ex.: 14.000 (milhar) / 1.234.567
+                if len(partes) > 2:
+                    txt_norm = "".join(partes)
+                else:
+                    # uma ocorrência: se exatamente 3 dígitos após ponto, tratar como milhar
+                    if len(partes) == 2 and len(partes[1]) == 3 and partes[0].isdigit() and partes[1].isdigit():
+                        txt_norm = "".join(partes)
+                    else:
+                        txt_norm = txt
+            else:
+                txt_norm = txt
+
+            try:
+                num = float(txt_norm)
+                return -num if negativo else num
+            except Exception:
+                return np.nan
+
+        def _parse_mes_ano_to_periodo(mes_ano) -> pd.Period | None:
+            if pd.isna(mes_ano):
+                return None
+            txt = str(mes_ano).strip()
+            if not txt:
+                return None
+            try:
+                mm, yyyy = txt.split("/")
+                return pd.Period(f"{int(yyyy):04d}-{int(mm):02d}", freq="M")
+            except Exception:
+                return None
+
+        def _periodo_to_label(p: pd.Period) -> str:
+            try:
+                return p.strftime("%m/%Y")
+            except Exception:
+                return str(p)
+
+        def _to_periodo_end(freq: str, p: pd.Period) -> tuple[pd.Period, str]:
+            if freq == "Mensal":
+                return p, _periodo_to_label(p)
+
+            if freq == "Anual":
+                end_p = pd.Period(f"{p.year:04d}-12", freq="M")
+                return end_p, "12/" + str(p.year)
+
+            if freq == "Bimestral":
+                bloco = ((p.month - 1) // 2) + 1
+                end_month = bloco * 2
+                end_p = pd.Period(f"{p.year:04d}-{end_month:02d}", freq="M")
+                return end_p, f"{end_month:02d}/{p.year}"
+
+            if freq == "Trimestral":
+                bloco = ((p.month - 1) // 3) + 1
+                end_month = bloco * 3
+                end_p = pd.Period(f"{p.year:04d}-{end_month:02d}", freq="M")
+                return end_p, f"{end_month:02d}/{p.year}"
+
+            if freq == "Semestral":
+                bloco = ((p.month - 1) // 6) + 1
+                end_month = bloco * 6
+                end_p = pd.Period(f"{p.year:04d}-{end_month:02d}", freq="M")
+                return end_p, f"{end_month:02d}/{p.year}"
+
+            return p, _periodo_to_label(p)
+
+        def _ler_meta() -> dict:
+            try:
+                if os.path.exists(RENTAB_META_PATH):
+                    with open(RENTAB_META_PATH, "r", encoding="utf-8") as f:
+                        return json.load(f)
+            except Exception:
+                return {}
+            return {}
+
+        def _salvar_meta(meta: dict) -> None:
+            try:
+                pasta = os.path.dirname(RENTAB_META_PATH)
+                if pasta and not os.path.exists(pasta):
+                    os.makedirs(pasta)
+                with open(RENTAB_META_PATH, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+        def _meta_atual() -> dict:
+            # Usa mtimes dos parquets que alimentam posições/proventos
+            def _mtime(path: str):
+                try:
+                    return os.path.getmtime(path) if os.path.exists(path) else None
+                except Exception:
+                    return None
+
+            return {
+                "acoes": _mtime(ACOES_PATH),
+                "renda_fixa": _mtime(RENDA_FIXA_PATH),
+                "proventos": _mtime(PROVENTOS_PATH),
+                "rentab_version": 7,
+            }
+
+        def _preparar_posicoes(df_cons: pd.DataFrame) -> pd.DataFrame:
+            if df_cons.empty:
+                return pd.DataFrame(columns=["Usuário", "Tipo", "Chave", "Periodo", "PeriodoStr", "PeriodoOrd", "Quantidade", "Preco", "Valor"])
+
+            dfp = df_cons.copy()
+
+            # Quantidade: para BR vem em "Quantidade Disponível", para Avenue em "Quantidade".
+            # Como o consolidado contém a união das colunas, a decisão precisa ser por-linha.
+            qtd = dfp["Quantidade Disponível"] if "Quantidade Disponível" in dfp.columns else None
+            if qtd is None:
+                qtd = dfp["Quantidade"] if "Quantidade" in dfp.columns else 0.0
+            else:
+                if "Quantidade" in dfp.columns:
+                    qtd = qtd.where(qtd.notna(), dfp["Quantidade"])
+            dfp["Quantidade"] = qtd
+            dfp["Quantidade"] = dfp["Quantidade"].apply(_parse_num_misto)
+            dfp["Quantidade"] = pd.to_numeric(dfp["Quantidade"], errors="coerce").fillna(0.0)
+
+            # Preço: usar exclusivamente a coluna 'Preço' (não derivar de Valor/Quantidade)
+            if "Preço" in dfp.columns:
+                dfp["Preco"] = dfp["Preço"].apply(_parse_num_misto)
+            else:
+                dfp["Preco"] = np.nan
+            dfp["Preco"] = dfp["Preco"].where(dfp["Preco"].notna() & (dfp["Preco"] > 0))
+
+            # Valor (para fallback controlado em tipos sem preço no relatório)
+            if "Valor" in dfp.columns:
+                dfp["ValorSrc"] = dfp["Valor"].apply(_parse_num_misto)
+            elif "Valor de Mercado" in dfp.columns:
+                dfp["ValorSrc"] = dfp["Valor de Mercado"].apply(_parse_num_misto)
+            else:
+                dfp["ValorSrc"] = np.nan
+            dfp["ValorSrc"] = pd.to_numeric(dfp["ValorSrc"], errors="coerce")
+
+            # Fallback de Preço apenas para tipos onde frequentemente não vem preço (RF/TD)
+            mask_sem_preco = dfp["Preco"].isna() | (dfp["Preco"] <= 0)
+            mask_tipo_fallback = dfp.get("Tipo").isin(["Renda Fixa", "Tesouro Direto"])
+            mask_qtd_ok = pd.to_numeric(dfp["Quantidade"], errors="coerce").fillna(0.0) > 0
+            mask_val_ok = pd.to_numeric(dfp["ValorSrc"], errors="coerce").fillna(0.0) > 0
+            mask_fallback = mask_sem_preco & mask_tipo_fallback & mask_qtd_ok & mask_val_ok
+            if mask_fallback.any():
+                dfp.loc[mask_fallback, "Preco"] = dfp.loc[mask_fallback, "ValorSrc"] / dfp.loc[mask_fallback, "Quantidade"]
+                dfp["Preco"] = dfp["Preco"].where(dfp["Preco"].notna() & (dfp["Preco"] > 0))
+
+            if "Usuário" not in dfp.columns:
+                dfp["Usuário"] = "Não informado"
+            dfp["Usuário"] = dfp["Usuário"].fillna("Não informado")
+
+            if "Tipo" not in dfp.columns:
+                dfp["Tipo"] = "N/A"
+            dfp["Tipo"] = dfp["Tipo"].fillna("N/A")
+
+            # Chave: preferir ticker, senão Ativo
+            if "Ticker" in dfp.columns:
+                chave = dfp["Ticker"].apply(_norm_key)
+                if "Ativo" in dfp.columns:
+                    vazio = chave.astype(str).str.strip() == ""
+                    chave = chave.where(~vazio, dfp["Ativo"].apply(_norm_key))
+            else:
+                chave = dfp.get("Ativo", "").apply(_norm_key)
+            dfp["Chave"] = chave
+
+            dfp["Periodo"] = dfp.get("Mês/Ano").apply(_parse_mes_ano_to_periodo)
+            dfp = dfp[dfp["Periodo"].notna()].copy()
+            dfp["PeriodoStr"] = dfp["Periodo"].astype(str)  # YYYY-MM
+            dfp["PeriodoOrd"] = dfp["Periodo"].apply(lambda p: int(p.ordinal))
+
+            # Agregar por usuário/tipo/chave/mês
+            def _first_non_null(s: pd.Series):
+                s2 = s.dropna()
+                return s2.iloc[0] if len(s2) else np.nan
+
+            dfp = dfp.groupby(["Usuário", "Tipo", "Chave", "PeriodoStr", "PeriodoOrd"], as_index=False).agg(
+                Quantidade=("Quantidade", "sum"),
+                Preco=("Preco", _first_non_null),
+            )
+            dfp["Valor"] = (pd.to_numeric(dfp["Quantidade"], errors="coerce").fillna(0.0) * pd.to_numeric(dfp["Preco"], errors="coerce")).fillna(0.0)
+            return dfp
+
+        def _preparar_dividendos(df_div: pd.DataFrame) -> pd.DataFrame:
+            if df_div is None or df_div.empty:
+                return pd.DataFrame(columns=["Usuário", "Chave", "PeriodoStr", "Dividendos"])
+
+            dfd = df_div.copy()
+            if "Usuário" not in dfd.columns:
+                dfd["Usuário"] = "Não informado"
+            dfd["Usuário"] = dfd["Usuário"].fillna("Não informado")
+
+            if "Data" in dfd.columns:
+                dfd["Data"] = pd.to_datetime(dfd["Data"], errors="coerce")
+            else:
+                dfd["Data"] = pd.NaT
+            dfd = dfd[dfd["Data"].notna()].copy()
+            dfd["PeriodoStr"] = dfd["Data"].dt.to_period("M").astype(str)
+
+            if "Ativo" in dfd.columns:
+                dfd["Chave"] = dfd["Ativo"].apply(_norm_key)
+            else:
+                dfd["Chave"] = ""
+
+            if "Valor Líquido" in dfd.columns:
+                dfd["Dividendos"] = dfd["Valor Líquido"].apply(_parse_num_misto)
+            else:
+                dfd["Dividendos"] = 0.0
+            dfd["Dividendos"] = pd.to_numeric(dfd["Dividendos"], errors="coerce").fillna(0.0)
+            
+            # Soma simples de dividendos por ativo/mês (sem dividir por quantidade do provento)
+            dfd = dfd.groupby(["Usuário", "Chave", "PeriodoStr"], as_index=False).agg(Dividendos=("Dividendos", "sum"))
+            return dfd
+
+        def _calcular_base_rentabilidade(df_pos: pd.DataFrame, df_div: pd.DataFrame) -> pd.DataFrame:
+            if df_pos.empty:
+                return pd.DataFrame(columns=[
+                    "Usuário", "Tipo", "Chave", "MesAno",
+                    "QuantidadeAnterior", "QuantidadeAtual", "QuantidadeBase",
+                    "PrecoAnterior", "PrecoAtual", "ValorInicial", "ValorFinal",
+                    "Dividendos", "RetornoPct",
+                    "PeriodoStr", "PeriodoOrd",
+                ])
+
+            dfp = df_pos.sort_values(["Usuário", "Tipo", "Chave", "PeriodoOrd"]).copy()
+
+            dfp["PeriodoOrdPrev"] = dfp.groupby(["Usuário", "Tipo", "Chave"])["PeriodoOrd"].shift(1)
+            dfp["QuantidadeAnterior"] = dfp.groupby(["Usuário", "Tipo", "Chave"])["Quantidade"].shift(1)
+            dfp["PrecoAnterior"] = dfp.groupby(["Usuário", "Tipo", "Chave"])["Preco"].shift(1)
+            dfp["PeriodoStrPrev"] = dfp.groupby(["Usuário", "Tipo", "Chave"])["PeriodoStr"].shift(1)
+
+            dfp["QuantidadeAnterior"] = pd.to_numeric(dfp["QuantidadeAnterior"], errors="coerce").fillna(0.0)
+            dfp["QuantidadeAtual"] = pd.to_numeric(dfp["Quantidade"], errors="coerce").fillna(0.0)
+            dfp["PrecoAnterior"] = pd.to_numeric(dfp["PrecoAnterior"], errors="coerce")
+            dfp["PrecoAtual"] = pd.to_numeric(dfp["Preco"], errors="coerce")
+
+            # Mantém apenas meses consecutivos para evitar saltos grandes
+            dfp = dfp[dfp["PeriodoOrdPrev"].notna()].copy()
+            dfp = dfp[(dfp["PeriodoOrd"] - dfp["PeriodoOrdPrev"]) == 1].copy()
+
+            # Quantidade base = quantidade do mês anterior (com proteção se houve venda)
+            dfp["QuantidadeBase"] = pd.to_numeric(dfp["QuantidadeAnterior"], errors="coerce").fillna(0.0)
+
+            dfp["ValorInicial"] = (dfp["QuantidadeBase"] * dfp["PrecoAnterior"]).fillna(0.0)
+            dfp["ValorFinal"] = (dfp["QuantidadeBase"] * dfp["PrecoAtual"]).fillna(0.0)
+
+            # Dividendos por ativo no mês corrente (soma simples)
+            if df_div is not None and not df_div.empty:
+                dfp = dfp.merge(df_div, on=["Usuário", "Chave", "PeriodoStr"], how="left")
+                dfp["Dividendos"] = pd.to_numeric(dfp["Dividendos"], errors="coerce").fillna(0.0)
+            else:
+                dfp["Dividendos"] = 0.0
+
+            dfp["RetornoPct"] = np.where(
+                dfp["ValorInicial"] > 0,
+                ((dfp["ValorFinal"] + dfp["Dividendos"]) - dfp["ValorInicial"]) / dfp["ValorInicial"] * 100.0,
+                np.nan,
+            )
+
+            # Label MM/YYYY a partir de PeriodoStr
+            try:
+                per = pd.PeriodIndex(dfp["PeriodoStr"], freq="M")
+                dfp["MesAno"] = per.strftime("%m/%Y")
+            except Exception:
+                dfp["MesAno"] = dfp["PeriodoStr"].astype(str)
+
+            cols = [
+                "Usuário", "Tipo", "Chave", "MesAno",
+                "QuantidadeAnterior", "QuantidadeAtual", "QuantidadeBase",
+                "PrecoAnterior", "PrecoAtual", "ValorInicial", "ValorFinal",
+                "Dividendos", "RetornoPct",
+                "PeriodoStr", "PeriodoOrd",
+            ]
+            return dfp[cols]
+
+        def _carregar_ou_gerar_base(df_posicoes: pd.DataFrame, df_div: pd.DataFrame) -> pd.DataFrame:
+            meta_old = _ler_meta()
+            meta_new = _meta_atual()
+            needs_rebuild = (meta_old != meta_new) or (not os.path.exists(RENTAB_PARQUET_PATH))
+
+            if not needs_rebuild:
+                try:
+                    return pd.read_parquet(RENTAB_PARQUET_PATH)
+                except Exception:
+                    needs_rebuild = True
+
+            df_pos = _preparar_posicoes(df_posicoes)
+            df_div_prep = _preparar_dividendos(df_div)
+            base = _calcular_base_rentabilidade(df_pos, df_div_prep)
+
+            try:
+                pasta = os.path.dirname(RENTAB_PARQUET_PATH)
+                if pasta and not os.path.exists(pasta):
+                    os.makedirs(pasta)
+                base.to_parquet(RENTAB_PARQUET_PATH, index=False)
+                _salvar_meta(meta_new)
+            except Exception:
+                pass
+
+            return base
+
+        def _agregar_composto(df_mensal: pd.DataFrame, freq: str, group_col: str) -> pd.DataFrame:
+            if df_mensal.empty:
+                return df_mensal
+
+            df = df_mensal.copy()
+            # Converte PeriodoStr -> Period (para ordenação/agregação)
+            per = pd.PeriodIndex(df["PeriodoStr"].astype(str), freq="M")
+            df["Periodo"] = per
+            df["Fator"] = 1.0 + (pd.to_numeric(df["RetornoPct"], errors="coerce") / 100.0)
+
+            def _bucket(p: pd.Period):
+                end_p, label = _to_periodo_end(freq, p)
+                return end_p, label
+
+            tmp = df["Periodo"].apply(_bucket)
+            df["PeriodoEnd"] = tmp.apply(lambda t: t[0])
+            df["Label"] = tmp.apply(lambda t: t[1])
+
+            grp_cols = [group_col, "PeriodoEnd", "Label"]
+            agg = df.groupby(grp_cols, as_index=False).agg(
+                Fator=("Fator", "prod"),
+                Dividendos=("Dividendos", "sum"),
+                ValorInicial=("ValorInicial", "sum"),
+                ValorFinal=("ValorFinal", "sum"),
+            )
+            agg["RetornoPct"] = (agg["Fator"] - 1.0) * 100.0
+            return agg
+
+        if df_consolidado_geral.empty:
+            st.info("Sem dados de posições para calcular rentabilidade.")
+        else:
+            # Gera / carrega base detalhada (ativo x mês) e salva em parquet
+            base = _carregar_ou_gerar_base(df_consolidado_geral, df_dividendos_consolidado)
+            if base.empty:
+                st.info("Dados insuficientes para calcular rentabilidade (precisa de meses consecutivos e ativos com preço/quantidade).")
+            else:
+                usuarios_disp = sorted([u for u in base["Usuário"].dropna().unique()])
+                tipos_disp = sorted([t for t in base["Tipo"].dropna().unique()])
+                ativos_disp = sorted([a for a in base["Chave"].dropna().unique() if str(a).strip() != ""])
+
+                col_f1, col_f2, col_f3 = st.columns(3)
+                with col_f1:
+                    usuarios_sel = st.multiselect("Usuário", usuarios_disp, default=usuarios_disp, key="rentab_usuarios")
+                with col_f2:
+                    tipos_sel = st.multiselect("Tipo", tipos_disp, default=tipos_disp, key="rentab_tipos")
+                with col_f3:
+                    modo_vis = st.selectbox("Visualização", ["Total (Carteira)", "Por Ativo"], index=0, key="rentab_modo")
+
+                col_a1, col_a2 = st.columns(2)
+                with col_a1:
+                    ativos_sel = st.multiselect("Ativo/Ticker", ativos_disp, default=ativos_disp, key="rentab_ativos")
+                with col_a2:
+                    freq_sel = st.selectbox("Período (Rentabilidade)", ["Mensal", "Bimestral", "Trimestral", "Semestral", "Anual"], index=0, key="rentab_freq")
+
+                base_f = base.copy()
+                if usuarios_sel:
+                    base_f = base_f[base_f["Usuário"].isin(usuarios_sel)]
+                if tipos_sel:
+                    base_f = base_f[base_f["Tipo"].isin(tipos_sel)]
+                if ativos_sel:
+                    base_f = base_f[base_f["Chave"].isin(ativos_sel)]
+
+                # ===== Evolução patrimonial bruta (mensal, sem “tratar” além do sum) =====
+                st.markdown("---")
+                st.subheader("💚 Evolução Patrimonial Bruta")
+
+                df_patr_src = df_consolidado_geral.copy()
+                if usuarios_sel and "Usuário" in df_patr_src.columns:
+                    df_patr_src = df_patr_src[df_patr_src["Usuário"].isin(usuarios_sel)]
+                if tipos_sel and "Tipo" in df_patr_src.columns:
+                    df_patr_src = df_patr_src[df_patr_src["Tipo"].isin(tipos_sel)]
+                if "Valor" not in df_patr_src.columns and "Valor de Mercado" in df_patr_src.columns:
+                    df_patr_src["Valor"] = df_patr_src["Valor de Mercado"]
+                df_patr_src["Valor"] = pd.to_numeric(df_patr_src.get("Valor"), errors="coerce").fillna(0.0)
+                df_patr_src["Periodo"] = df_patr_src.get("Mês/Ano").apply(_parse_mes_ano_to_periodo)
+                df_patr_src = df_patr_src[df_patr_src["Periodo"].notna()].copy()
+                df_patr_src["Label"] = df_patr_src["Periodo"].apply(_periodo_to_label)
+                df_patr = df_patr_src.groupby(["Periodo", "Label"], as_index=False).agg(Valor=("Valor", "sum")).sort_values(["Periodo"])
+
+                if df_patr.empty:
+                    st.info("Sem dados para evolução patrimonial.")
+                else:
+                    from plotly.colors import sample_colorscale
+                    greens = px.colors.sequential.Greens
+                    n_bars = len(df_patr)
+                    bar_colors = sample_colorscale(greens, [i/(n_bars-1) if n_bars>1 else 0 for i in range(n_bars)])
+
+                    fig_patr = px.bar(
+                        x=df_patr["Label"],
+                        y=df_patr["Valor"],
+                        labels={"x": "Período", "y": "Patrimônio (R$)"},
+                        text=[f"R$ {v:,.2f}" for v in df_patr["Valor"].values],
+                        title="Patrimônio Bruto (Mensal)"
+                    )
+                    fig_patr.update_traces(textposition="outside", cliponaxis=False, marker_color=bar_colors)
+                    fig_patr.update_layout(yaxis_tickformat=",.2f", margin=dict(t=60))
+                    st.plotly_chart(fig_patr, use_container_width=True, key="rentab_patrimonio")
+
+                # ===== Rentabilidade (juros compostos a partir da base mensal por ativo) =====
+                st.markdown("---")
+                st.subheader("📈 Rentabilidade")
+
+                if base_f.empty:
+                    st.info("Sem dados após filtros.")
+                else:
+                    # mensal: agregação depende do modo
+                    if modo_vis == "Total (Carteira)":
+                        mensal = base_f.groupby(["Usuário", "PeriodoStr"], as_index=False).agg(
+                            ValorInicial=("ValorInicial", "sum"),
+                            ValorFinal=("ValorFinal", "sum"),
+                            Dividendos=("Dividendos", "sum"),
+                        )
+                        mensal["RetornoPct"] = np.where(
+                            mensal["ValorInicial"] > 0,
+                            ((mensal["ValorFinal"] + mensal["Dividendos"]) - mensal["ValorInicial"]) / mensal["ValorInicial"] * 100.0,
+                            np.nan,
+                        )
+                        mensal = mensal.rename(columns={"Usuário": "Serie"})
+
+                        # Total (todos usuários selecionados)
+                        total = mensal.groupby(["PeriodoStr"], as_index=False).agg(
+                            ValorInicial=("ValorInicial", "sum"),
+                            ValorFinal=("ValorFinal", "sum"),
+                            Dividendos=("Dividendos", "sum"),
+                        )
+                        total["RetornoPct"] = np.where(
+                            total["ValorInicial"] > 0,
+                            ((total["ValorFinal"] + total["Dividendos"]) - total["ValorInicial"]) / total["ValorInicial"] * 100.0,
+                            np.nan,
+                        )
+                        total["Serie"] = "Total"
+                        mensal = pd.concat([mensal, total], ignore_index=True)
+                    else:
+                        mensal = base_f.groupby(["Chave", "PeriodoStr"], as_index=False).agg(
+                            ValorInicial=("ValorInicial", "sum"),
+                            ValorFinal=("ValorFinal", "sum"),
+                            Dividendos=("Dividendos", "sum"),
+                        )
+                        mensal["RetornoPct"] = np.where(
+                            mensal["ValorInicial"] > 0,
+                            ((mensal["ValorFinal"] + mensal["Dividendos"]) - mensal["ValorInicial"] ) / mensal["ValorInicial"] * 100.0,
+                            np.nan,
+                        )
+                        mensal = mensal.rename(columns={"Chave": "Serie"})
+
+                    df_plot = _agregar_composto(mensal, freq_sel, group_col="Serie")
+                    df_plot = df_plot[df_plot["PeriodoEnd"].notna()].sort_values(["PeriodoEnd", "Serie"]).copy()
+
+                    fig = px.line(
+                        df_plot,
+                        x="Label",
+                        y="RetornoPct",
+                        color="Serie",
+                        markers=True,
+                        labels={"Label": "Período", "RetornoPct": "Rentabilidade (%)"},
+                        title=f"Rentabilidade {freq_sel} (juros compostos)"
+                    )
+                    fig.update_layout(margin=dict(t=60))
+                    st.plotly_chart(fig, use_container_width=True, key="rentab_chart")
+
+                    with st.expander("📋 Ver base mensal (ativo x mês)", expanded=False):
+                        cols_show = [
+                            "Usuário", "Tipo", "Chave", "MesAno",
+                            "QuantidadeAnterior", "QuantidadeAtual", "QuantidadeBase",
+                            "PrecoAnterior", "PrecoAtual", "ValorInicial", "ValorFinal",
+                            "Dividendos", "RetornoPct",
+                        ]
+                        cols_show = [c for c in cols_show if c in base_f.columns]
+                        st.dataframe(base_f[cols_show], use_container_width=True, hide_index=True)
+
+                    with st.expander("📋 Ver tabela do gráfico", expanded=False):
+                        tabela = df_plot[["Serie", "Label", "RetornoPct"]].copy()
+                        tabela["RetornoPct"] = pd.to_numeric(tabela["RetornoPct"], errors="coerce")
+                        st.dataframe(tabela, use_container_width=True, hide_index=True)
 
 # ============ TAB OUTROS ============
 with tab_outros:

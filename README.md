@@ -143,7 +143,7 @@ invest/
 
 ## 🎯 Organização da Interface (APP.py)
 
-A interface foi reorganizada em **4 tabs principais** com **subtabs**:
+A interface possui **5 tabs principais** com **subtabs**:
 
 ### 📈 **1. Ações**
 - **Ações BR**: Ações brasileiras (B3)
@@ -160,7 +160,10 @@ A interface foi reorganizada em **4 tabs principais** com **subtabs**:
 - **Dividendos Avenue**: Proventos Avenue
 - **Dividendos Consolidados**: Todos os proventos unificados
 
-### ⚙️ **4. Outros**
+### 📊 **4. Consolidação**
+- **Consolidação Geral**: Une todos os investimentos (BR + Avenue) em uma visão única com filtros, métricas e gráficos de distribuição.
+
+### ⚙️ **5. Outros**
 - **Cadastro**: Gestão de usuários
 - **Inserção Manual**: Entrada manual de dados
 

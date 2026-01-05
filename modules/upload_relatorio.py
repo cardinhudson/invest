@@ -2,6 +2,53 @@ import os
 import re
 import pandas as pd
 
+
+def _parse_num_misto(valor):
+    """Parse numérico tolerante a formatos pt-BR/US (milhar e decimal)."""
+    if pd.isna(valor):
+        return None
+    if isinstance(valor, (int, float)):
+        return float(valor)
+    txt = str(valor).strip()
+    if not txt:
+        return None
+    txt = txt.replace("R$", "").replace("US$", "").replace("$", "")
+    txt = txt.replace("%", "").replace("\u00a0", " ").replace(" ", "")
+    negativo = False
+    if txt.startswith("(") and txt.endswith(")"):
+        negativo = True
+        txt = txt[1:-1]
+    if txt.startswith("+"):
+        txt = txt[1:]
+    elif txt.startswith("-"):
+        negativo = True
+        txt = txt[1:]
+
+    if not txt:
+        return None
+
+    if "." in txt and "," in txt:
+        txt_norm = txt.replace(".", "").replace(",", ".")
+    elif "," in txt:
+        txt_norm = txt.replace(".", "").replace(",", ".")
+    elif "." in txt:
+        partes = txt.split(".")
+        if len(partes) > 2:
+            txt_norm = "".join(partes)
+        else:
+            if len(partes) == 2 and len(partes[1]) == 3 and partes[0].isdigit() and partes[1].isdigit():
+                txt_norm = "".join(partes)
+            else:
+                txt_norm = txt
+    else:
+        txt_norm = txt
+
+    try:
+        num = float(txt_norm)
+        return -num if negativo else num
+    except Exception:
+        return None
+
 PARQUET_PATH = "data/historico_investimentos.parquet"
 ACOES_PATH = "data/acoes.parquet"
 RENDA_FIXA_PATH = "data/renda_fixa.parquet"
@@ -24,6 +71,7 @@ def coerci_numericos(df: pd.DataFrame, palavras=None) -> pd.DataFrame:
     for col in df.columns:
         col_lower = str(col).lower()
         if any(p in col_lower for p in palavras):
+            df[col] = df[col].apply(_parse_num_misto)
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
@@ -141,13 +189,15 @@ def criar_coluna_valor_renda_fixa(df: pd.DataFrame) -> pd.DataFrame:
     if "Valor Atualizado CURVA" in df.columns:
         mask = df["Valor"].isna() | (df["Valor"] == "") | (df["Valor"] == "-")
         df.loc[mask, "Valor"] = df.loc[mask, "Valor Atualizado CURVA"]
+    df["Valor"] = df["Valor"].apply(_parse_num_misto)
     df["Valor"] = pd.to_numeric(df["Valor"], errors="coerce")
     return df
 
 
 def criar_coluna_valor_acoes(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["Valor"] = pd.to_numeric(df.get("Valor Atualizado"), errors="coerce")
+    df["Valor"] = df.get("Valor Atualizado").apply(_parse_num_misto)
+    df["Valor"] = pd.to_numeric(df["Valor"], errors="coerce")
     return df
 
 
@@ -155,6 +205,7 @@ def filtrar_linhas_ativas(df: pd.DataFrame, coluna_valor: str) -> pd.DataFrame:
     df = df.copy()
     if coluna_valor not in df.columns:
         return df.iloc[0:0]
+    df[coluna_valor] = df[coluna_valor].apply(_parse_num_misto)
     df[coluna_valor] = pd.to_numeric(df[coluna_valor], errors="coerce")
     df = df[df[coluna_valor].notnull() & (df[coluna_valor] > 0)]
     return df
@@ -171,8 +222,14 @@ def filtrar_proventos(df: pd.DataFrame, colunas_essenciais) -> pd.DataFrame:
         ):
             df = df.iloc[:-1]
     if "Valor Líquido" in df.columns:
+        df["Valor Líquido"] = df["Valor Líquido"].apply(_parse_num_misto)
         df["Valor Líquido"] = pd.to_numeric(df["Valor Líquido"], errors="coerce")
         df = df[df["Valor Líquido"].notnull() & (df["Valor Líquido"] > 0)]
+
+    for col in ["Quantidade", "Preço unitário", "Preco unitario"]:
+        if col in df.columns:
+            df[col] = df[col].apply(_parse_num_misto)
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
 
@@ -190,6 +247,11 @@ def ler_relatorio_excel(file, usuario: str, mes_ano: str):
         df_sheet = pd.read_excel(xls, sheet_name=nome, header=header_row)
         df_sheet = limpar_colunas_duplicadas(df_sheet)
         tipo = classificar_sheet(nome, df_sheet)
+
+        # Para proventos, reler como texto para não perder milhares (ex.: '1.500' -> 1500)
+        if tipo == "prov":
+            df_sheet = pd.read_excel(xls, sheet_name=nome, header=header_row, dtype=str)
+            df_sheet = limpar_colunas_duplicadas(df_sheet)
 
         if tipo == "rf":
             df_rf = df_sheet
@@ -235,7 +297,32 @@ def ler_relatorio_excel(file, usuario: str, mes_ano: str):
 
         elif tipo == "prov":
             df_prov = df_sheet
-            colunas_essenciais_prov = ["Produto", "Data de Pagamento", "Tipo de Provento", "Valor Líquido"]
+            # Proventos Recebidos: preservar também Quantidade/Preço unitário para cálculo por-ação
+            colunas_essenciais_prov = [
+                "Produto",
+                "Data de Pagamento",
+                "Tipo de Provento",
+                "Valor Líquido",
+                "Instituição",
+                "Quantidade",
+                "Preço unitário",
+            ]
+
+            # Sinônimos comuns nas planilhas
+            if "Data de Pagamento" not in df_prov.columns and "Pagamento" in df_prov.columns:
+                df_prov["Data de Pagamento"] = df_prov["Pagamento"]
+            if "Tipo de Provento" not in df_prov.columns and "Tipo de Evento" in df_prov.columns:
+                df_prov["Tipo de Provento"] = df_prov["Tipo de Evento"]
+            if "Valor Líquido" not in df_prov.columns:
+                for c in df_prov.columns:
+                    if str(c).strip().lower() == "valor líquido" or str(c).strip().lower() == "valor liquido" or str(c).strip().lower() == "valor líquido".lower():
+                        df_prov["Valor Líquido"] = df_prov[c]
+                if "Valor Líquido" not in df_prov.columns and "Valor líquido" in df_prov.columns:
+                    df_prov["Valor Líquido"] = df_prov["Valor líquido"]
+            if "Preço unitário" not in df_prov.columns:
+                for c in df_prov.columns:
+                    if str(c).strip().lower() in ["preço unitário", "preco unitario", "preco unitário", "preço unitario"]:
+                        df_prov["Preço unitário"] = df_prov[c]
             for col in colunas_essenciais_prov:
                 if col not in df_prov.columns:
                     for c in df_prov.columns:
@@ -281,6 +368,14 @@ def salvar_tipo_parquet(df_tipo: pd.DataFrame, path: str, chaves_substituicao=No
             combinado = combinado.drop_duplicates(subset=dedup_subset, keep="last")
     print(f"Salvando {len(combinado)} linhas em {path}")
     combinado.to_parquet(path)
+
+    # Atualizar cache de Setor/Segmento (yfinance) apenas para Ações
+    try:
+        if os.path.normpath(path) == os.path.normpath(ACOES_PATH):
+            from modules.ticker_info import atualizar_cache_por_df
+            atualizar_cache_por_df(combinado)
+    except Exception:
+        pass
     return combinado
 
 
@@ -352,8 +447,9 @@ def padronizar_renda_fixa(df_rf: pd.DataFrame) -> pd.DataFrame:
     resultado["Usuário"] = df.get("Usuário")
     resultado["Mês/Ano"] = df.get("Mês/Ano")
     
-    # Converte para numérico
+    # Converte para numérico (tolerante a separadores)
     for col in ["Quantidade Disponível", "Preço", "Valor"]:
+        resultado[col] = resultado[col].apply(_parse_num_misto)
         resultado[col] = pd.to_numeric(resultado[col], errors="coerce")
     
     return resultado
@@ -376,8 +472,9 @@ def padronizar_acoes(df_acoes: pd.DataFrame) -> pd.DataFrame:
     resultado["Usuário"] = df.get("Usuário")
     resultado["Mês/Ano"] = df.get("Mês/Ano")
     
-    # Converte para numérico
+    # Converte para numérico (tolerante a separadores)
     for col in ["Quantidade Disponível", "Preço", "Valor"]:
+        resultado[col] = resultado[col].apply(_parse_num_misto)
         resultado[col] = pd.to_numeric(resultado[col], errors="coerce")
     
     return resultado
@@ -458,21 +555,42 @@ def padronizar_dividendos(df_proventos: pd.DataFrame) -> pd.DataFrame:
     
     # Ativo (extrai ticker do Produto se possível)
     resultado["Ativo"] = df.get("Produto").apply(lambda x: str(x).split(" - ")[0] if pd.notna(x) else "")
+
+    # Quantidade (quando disponível no relatório)
+    if "Quantidade" in df.columns:
+        resultado["Quantidade"] = df.get("Quantidade").apply(_parse_num_misto)
+        resultado["Quantidade"] = pd.to_numeric(resultado["Quantidade"], errors="coerce")
+    else:
+        resultado["Quantidade"] = pd.NA
+
+    # Preço unitário (quando disponível no relatório)
+    if "Preço unitário" in df.columns:
+        resultado["Preço unitário"] = df.get("Preço unitário").apply(_parse_num_misto)
+        resultado["Preço unitário"] = pd.to_numeric(resultado["Preço unitário"], errors="coerce")
+    elif "Preco unitario" in df.columns:
+        resultado["Preço unitário"] = df.get("Preco unitario").apply(_parse_num_misto)
+        resultado["Preço unitário"] = pd.to_numeric(resultado["Preço unitário"], errors="coerce")
+    else:
+        resultado["Preço unitário"] = pd.NA
     
     # Valor Bruto (se não existir, assume igual ao Valor Líquido)
     if "Valor Bruto" in df.columns:
-        resultado["Valor Bruto"] = pd.to_numeric(df.get("Valor Bruto"), errors="coerce")
+        resultado["Valor Bruto"] = df.get("Valor Bruto").apply(_parse_num_misto)
+        resultado["Valor Bruto"] = pd.to_numeric(resultado["Valor Bruto"], errors="coerce")
     else:
-        resultado["Valor Bruto"] = pd.to_numeric(df.get("Valor Líquido"), errors="coerce")
+        resultado["Valor Bruto"] = df.get("Valor Líquido").apply(_parse_num_misto)
+        resultado["Valor Bruto"] = pd.to_numeric(resultado["Valor Bruto"], errors="coerce")
     
     # Impostos (se não existir, assume 0)
     if "Impostos" in df.columns:
-        resultado["Impostos"] = pd.to_numeric(df.get("Impostos"), errors="coerce").fillna(0)
+        resultado["Impostos"] = df.get("Impostos").apply(_parse_num_misto)
+        resultado["Impostos"] = pd.to_numeric(resultado["Impostos"], errors="coerce").fillna(0)
     else:
         resultado["Impostos"] = 0.0
     
     # Valor Líquido
-    resultado["Valor Líquido"] = pd.to_numeric(df.get("Valor Líquido"), errors="coerce")
+    resultado["Valor Líquido"] = df.get("Valor Líquido").apply(_parse_num_misto)
+    resultado["Valor Líquido"] = pd.to_numeric(resultado["Valor Líquido"], errors="coerce")
     
     # Usuário
     if "Usuário" in df.columns:
@@ -500,4 +618,4 @@ def padronizar_dividendos(df_proventos: pd.DataFrame) -> pd.DataFrame:
     resultado = resultado.dropna(subset=["Ativo", "Valor Líquido"])
     resultado = resultado[resultado["Valor Líquido"] != 0]
     
-    return resultado[["Data", "Ativo", "Valor Bruto", "Impostos", "Valor Líquido", "Fonte"]]
+    return resultado[["Data", "Ativo", "Quantidade", "Preço unitário", "Valor Bruto", "Impostos", "Valor Líquido", "Fonte"]]

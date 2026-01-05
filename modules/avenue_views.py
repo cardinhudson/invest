@@ -32,6 +32,30 @@ from modules.cotacoes import (
     obter_historico_acao
 )
 
+from modules.ticker_info import CACHE_PATH as TICKER_INFO_PATH
+
+
+@st.cache_data(show_spinner=False)
+def _read_ticker_info_cached(path: str, mtime: float) -> pd.DataFrame:
+    return pd.read_parquet(path)
+
+
+@st.cache_data(show_spinner=False)
+def _read_parquet_cached(path: str, mtime: float) -> pd.DataFrame:
+    return pd.read_parquet(path)
+
+
+def extrair_ticker_curto(valor):
+    """Extrai ticker curto de rótulos longos como 'AAPL - Apple'."""
+    if pd.isna(valor):
+        return None
+    texto = str(valor).strip()
+    if not texto:
+        return None
+    if " - " in texto:
+        return texto.split(" - ", 1)[0].strip()
+    return texto.split()[0].strip()
+
 
 def carregar_acoes_avenue() -> pd.DataFrame:
     """
@@ -40,7 +64,8 @@ def carregar_acoes_avenue() -> pd.DataFrame:
     """
     if os.path.exists(ACOES_PDF_PATH):
         try:
-            return pd.read_parquet(ACOES_PDF_PATH)
+            mtime = os.path.getmtime(ACOES_PDF_PATH)
+            return _read_parquet_cached(ACOES_PDF_PATH, mtime)
         except Exception as e:
             st.warning(f"Erro ao carregar ações Avenue: {e}")
             return pd.DataFrame()
@@ -54,7 +79,8 @@ def carregar_dividendos_avenue() -> pd.DataFrame:
     """
     if os.path.exists(DIVIDENDOS_PDF_PATH):
         try:
-            return pd.read_parquet(DIVIDENDOS_PDF_PATH)
+            mtime = os.path.getmtime(DIVIDENDOS_PDF_PATH)
+            return _read_parquet_cached(DIVIDENDOS_PDF_PATH, mtime)
         except Exception as e:
             st.warning(f"Erro ao carregar dividendos Avenue: {e}")
             return pd.DataFrame()
@@ -713,50 +739,59 @@ def aba_acoes_avenue():
     cotacao_atual = obter_cotacao_atual_usd_brl()
     mes_ano_ref = None
     cotacao_mes = cotacao_atual
+    def _ordena_meses(meses):
+        def _key(m):
+            try:
+                mes, ano = m.split("/")
+                return int(ano)*100+int(mes)
+            except Exception:
+                return m
+        return sorted(meses, key=_key)
+
     if "Mês/Ano" in df_padrao.columns:
-        meses_disponiveis = sorted(df_padrao["Mês/Ano"].dropna().unique())
+        meses_disponiveis = _ordena_meses(df_padrao["Mês/Ano"].dropna().unique())
         if meses_disponiveis:
             mes_ano_ref = meses_disponiveis[-1]
             cotacao_mes = obter_cotacao_mes(mes_ano_ref)
     
     # ========== CONVERSÃO DE VALORES ==========
+    # Os valores extraídos do PDF Avenue vêm em USD.
+    # Para exibir em BRL, convertemos USD->BRL usando a cotação do mês/ano da linha.
     df_visualizacao = df_padrao.copy()
-    
-    # Armazenar valores originais em USD
-    if "Valor de Mercado" in df_visualizacao.columns:
-        if "Valor_USD_Original" not in df_visualizacao.columns:
-            # Assumir que valores originais estão em BRL (já convertidos)
-            # Converter de volta para USD para ter base
+
+    if "Valor_USD_Original" not in df_visualizacao.columns and "Valor de Mercado" in df_visualizacao.columns:
+        df_visualizacao["Valor_USD_Original"] = pd.to_numeric(df_visualizacao["Valor de Mercado"], errors="coerce")
+    if "Preco_USD_Original" not in df_visualizacao.columns and "Preço" in df_visualizacao.columns:
+        df_visualizacao["Preco_USD_Original"] = pd.to_numeric(df_visualizacao["Preço"], errors="coerce")
+
+    if moeda == "BRL":
+        if "Valor_USD_Original" in df_visualizacao.columns:
             if "Mês/Ano" in df_visualizacao.columns:
-                df_visualizacao["Valor_USD_Original"] = df_visualizacao.apply(
-                    lambda row: converter_brl_para_usd(row["Valor de Mercado"], row["Mês/Ano"]) 
-                    if pd.notna(row["Mês/Ano"]) and pd.notna(row["Valor de Mercado"]) 
-                    else row["Valor de Mercado"],
+                df_visualizacao["Valor de Mercado"] = df_visualizacao.apply(
+                    lambda row: converter_usd_para_brl(row["Valor_USD_Original"], row["Mês/Ano"]) 
+                    if pd.notna(row.get("Mês/Ano")) and pd.notna(row.get("Valor_USD_Original"))
+                    else row.get("Valor de Mercado"),
                     axis=1
                 )
             else:
-                df_visualizacao["Valor_USD_Original"] = df_visualizacao["Valor de Mercado"] / cotacao_atual
-    
-    if "Preço" in df_visualizacao.columns:
-        if "Preco_USD_Original" not in df_visualizacao.columns:
+                df_visualizacao["Valor de Mercado"] = df_visualizacao["Valor_USD_Original"] * cotacao_atual
+
+        if "Preco_USD_Original" in df_visualizacao.columns:
             if "Mês/Ano" in df_visualizacao.columns:
-                df_visualizacao["Preco_USD_Original"] = df_visualizacao.apply(
-                    lambda row: converter_brl_para_usd(row["Preço"], row["Mês/Ano"]) 
-                    if pd.notna(row["Mês/Ano"]) and pd.notna(row["Preço"]) 
-                    else row["Preço"],
+                df_visualizacao["Preço"] = df_visualizacao.apply(
+                    lambda row: converter_usd_para_brl(row["Preco_USD_Original"], row["Mês/Ano"]) 
+                    if pd.notna(row.get("Mês/Ano")) and pd.notna(row.get("Preco_USD_Original"))
+                    else row.get("Preço"),
                     axis=1
                 )
             else:
-                df_visualizacao["Preco_USD_Original"] = df_visualizacao["Preço"] / cotacao_atual
-    
-    # Aplicar conversão conforme moeda selecionada
-    if moeda == "USD":
-        # Converter para USD
+                df_visualizacao["Preço"] = df_visualizacao["Preco_USD_Original"] * cotacao_atual
+    else:
+        # USD: mantém os valores originais
         if "Valor_USD_Original" in df_visualizacao.columns:
             df_visualizacao["Valor de Mercado"] = df_visualizacao["Valor_USD_Original"]
         if "Preco_USD_Original" in df_visualizacao.columns:
             df_visualizacao["Preço"] = df_visualizacao["Preco_USD_Original"]
-    # Se BRL, manter valores já convertidos (padrão do sistema)
     
     # ========== MÉTRICAS PRINCIPAIS ==========
     col1, col2, col3, col4, col5, col6 = st.columns(6)
@@ -819,7 +854,7 @@ def aba_acoes_avenue():
     
     with col_f3:
         if "Mês/Ano" in df_visualizacao.columns:
-            meses = sorted(df_visualizacao["Mês/Ano"].unique())
+            meses = _ordena_meses(df_visualizacao["Mês/Ano"].unique())
             mes_sel = st.selectbox(
                 "Mês/Ano",
                 meses,
@@ -865,6 +900,19 @@ def aba_acoes_avenue():
     elif ordenacao == "Quantidade (maior)":
         df_filtrado = df_filtrado.sort_values("Quantidade", ascending=False)
     
+    # Enriquecer com Setor/Segmento via cache local
+    try:
+        if os.path.exists(TICKER_INFO_PATH) and "Ticker" in df_filtrado.columns:
+            cache_mtime = os.path.getmtime(TICKER_INFO_PATH)
+            cache_df = _read_ticker_info_cached(TICKER_INFO_PATH, cache_mtime)
+            cols_cache = [c for c in ["Ticker", "Setor", "Segmento"] if c in cache_df.columns]
+            if cols_cache and "Setor" not in df_filtrado.columns:
+                df_filtrado = df_filtrado.merge(cache_df[cols_cache], on="Ticker", how="left")
+                df_filtrado["Setor"] = df_filtrado["Setor"].fillna("Ações Dólar")
+                df_filtrado["Segmento"] = df_filtrado["Segmento"].fillna("Ações Dólar")
+    except Exception:
+        pass
+
     # Remover colunas auxiliares da exibição
     colunas_exibir = [col for col in df_filtrado.columns if not col.endswith("_Original")]
     
@@ -877,25 +925,40 @@ def aba_acoes_avenue():
     st.subheader("📈 Análise")
     
     col_chart1, col_chart2 = st.columns(2)
-    
+
+    # Filtro Top N
+    opcoes_top = ["Top 10", "Top 15", "Top 20", "Top 30", "Todos"]
+    col_filtro_top1, col_filtro_top2 = st.columns(2)
+    with col_filtro_top1:
+        top_sel1 = st.selectbox("Quantidade (Posições)", opcoes_top, index=0, key="avenue_top_posicoes")
+        top_n1 = int(top_sel1.split()[1]) if top_sel1 != "Todos" else None
+    with col_filtro_top2:
+        top_sel2 = st.selectbox("Quantidade (Quantidades)", opcoes_top, index=0, key="avenue_top_quantidades")
+        top_n2 = int(top_sel2.split()[1]) if top_sel2 != "Todos" else None
+
     with col_chart1:
         if "Ticker" in df_filtrado.columns and "Valor de Mercado" in df_filtrado.columns:
-            dist_ticker = df_filtrado.groupby("Ticker")["Valor de Mercado"].sum().sort_values(ascending=False).head(10)
+            dist_ticker = df_filtrado.groupby("Ticker")["Valor de Mercado"].sum().sort_values(ascending=False)
+            if top_n1:
+                dist_ticker = dist_ticker.head(top_n1)
             fig = px.bar(
-                dist_ticker, 
-                title="Top 10 Maiores Posições", 
+                dist_ticker,
+                title=f"Top {top_n1 if top_n1 else 'Todos'} Maiores Posições",
                 labels={"value": f"Valor ({moeda})", "index": "Ticker"}
             )
             st.plotly_chart(fig, use_container_width=True)
-    
+
     with col_chart2:
         if "Ativo" in df_filtrado.columns and "Quantidade" in df_filtrado.columns:
-            dist_qtd = df_filtrado.nlargest(10, "Quantidade")[["Ativo", "Quantidade"]]
-            fig = px.bar(dist_qtd, x="Ativo", y="Quantidade", title="Top 10 Maiores Quantidades")
+            dist_qtd = df_filtrado.sort_values("Quantidade", ascending=False)
+            if top_n2:
+                dist_qtd = dist_qtd.head(top_n2)
+            dist_qtd = dist_qtd[['Ativo', 'Quantidade']].copy()
+            dist_qtd["Ticker"] = dist_qtd["Ativo"].apply(extrair_ticker_curto)
+            dist_qtd["Ticker"].fillna(dist_qtd["Ativo"], inplace=True)
+            fig = px.bar(dist_qtd, x="Ticker", y="Quantidade", title=f"Top {top_n2 if top_n2 else 'Todos'} Maiores Quantidades")
+            fig.update_traces(customdata=dist_qtd["Ativo"], hovertemplate="<b>%{customdata}</b><br>Ticker: %{x}<br>Qtd: %{y:,.2f}<extra></extra>")
             st.plotly_chart(fig, use_container_width=True)
-    
-    # ========== GRÁFICO HISTÓRICO DE COTAÇÃO ==========
-    exibir_grafico_historico_cotacao(key_prefix="acoes_avenue")
 
 
 def aba_proventos_avenue():
@@ -929,6 +992,15 @@ def aba_proventos_avenue():
     cotacao_atual = obter_cotacao_atual_usd_brl()
     mes_ano_ref = None
     cotacao_mes = cotacao_atual
+    def _ordena_meses(meses):
+        def _key(m):
+            try:
+                mes, ano = m.split("/")
+                return int(ano)*100+int(mes)
+            except Exception:
+                return m
+        return sorted(meses, key=_key)
+
     if "Data" in df_padrao.columns and not df_padrao.empty:
         data_mais_recente = df_padrao["Data"].max()
         if pd.notna(data_mais_recente):
@@ -936,27 +1008,33 @@ def aba_proventos_avenue():
             cotacao_mes = obter_cotacao_mes(mes_ano_ref)
     
     # ========== CONVERSÃO DE VALORES ==========
+    # Dividendos do PDF Avenue também vêm em USD.
     df_visualizacao = df_padrao.copy()
-    
-    # Armazenar valores originais em USD
+
     for col_valor in ["Valor Bruto", "Impostos", "Valor Líquido"]:
-        if col_valor in df_visualizacao.columns:
+        if col_valor not in df_visualizacao.columns:
+            continue
+        col_original = f"{col_valor.replace(' ', '_')}_USD_Original"
+        if col_original not in df_visualizacao.columns:
+            df_visualizacao[col_original] = pd.to_numeric(df_visualizacao[col_valor], errors="coerce")
+
+    if moeda == "BRL":
+        for col_valor in ["Valor Bruto", "Impostos", "Valor Líquido"]:
             col_original = f"{col_valor.replace(' ', '_')}_USD_Original"
             if col_original not in df_visualizacao.columns:
-                # Converter de volta para USD
-                if "Data" in df_visualizacao.columns:
-                    df_visualizacao[col_original] = df_visualizacao.apply(
-                        lambda row: converter_brl_para_usd(
-                            row[col_valor], 
-                            f"{row['Data'].month:02d}/{row['Data'].year}"
-                        ) if pd.notna(row["Data"]) and pd.notna(row[col_valor]) else row[col_valor],
-                        axis=1
-                    )
-                else:
-                    df_visualizacao[col_original] = df_visualizacao[col_valor] / cotacao_atual
-    
-    # Aplicar conversão conforme moeda selecionada
-    if moeda == "USD":
+                continue
+            if "Data" in df_visualizacao.columns:
+                df_visualizacao[col_valor] = df_visualizacao.apply(
+                    lambda row: converter_usd_para_brl(
+                        row[col_original],
+                        f"{row['Data'].month:02d}/{row['Data'].year}"
+                    ) if pd.notna(row.get("Data")) and pd.notna(row.get(col_original)) else row.get(col_valor),
+                    axis=1
+                )
+            else:
+                df_visualizacao[col_valor] = df_visualizacao[col_original] * cotacao_atual
+    else:
+        # USD
         for col_valor in ["Valor Bruto", "Impostos", "Valor Líquido"]:
             col_original = f"{col_valor.replace(' ', '_')}_USD_Original"
             if col_original in df_visualizacao.columns:
@@ -966,11 +1044,12 @@ def aba_proventos_avenue():
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     
     with col1:
-        st.metric("📄 Total de Registros", len(df_visualizacao))
+        total_registros = len(df_visualizacao)
+        st.metric("📊 Total de Proventos", total_registros)
     
     with col2:
         valor_bruto_total = df_visualizacao.get("Valor Bruto", pd.Series()).sum()
-        st.metric("💵 Valor Bruto Total", formatar_valor_moeda(valor_bruto_total, moeda))
+        st.metric("💰 Valor Bruto Total", formatar_valor_moeda(valor_bruto_total, moeda))
     
     with col3:
         impostos_total = df_visualizacao.get("Impostos", pd.Series()).sum()
@@ -1274,15 +1353,24 @@ def aba_dividendo_consolidado():
     with col_chart1:
         if "Ativo" in df_filtrado.columns and "Valor Líquido" in df_filtrado.columns:
             dist_ativo = df_filtrado.groupby("Ativo")["Valor Líquido"].sum().sort_values(ascending=False)
+            max_val = dist_ativo.values.max() if len(dist_ativo.values) else 0
+            tickers_x = [extrair_ticker_curto(a) or str(a) for a in dist_ativo.index]
             fig = px.bar(
-                x=dist_ativo.index,
+                x=tickers_x,
                 y=dist_ativo.values,
                 title="Dividendos por Ativo",
                 labels={"x": "Ativo", "y": "Valor Líquido ($)"},
                 text=[f"{v:,.2f}" for v in dist_ativo.values]
             )
-            fig.update_traces(textposition="outside")
-            fig.update_layout(yaxis_tickformat=",.2f")
+            fig.update_traces(
+                textposition="outside",
+                cliponaxis=False,
+                customdata=list(dist_ativo.index),
+                hovertemplate="<b>%{customdata}</b><br>Ticker: %{x}<br>Valor: %{y:,.2f}<extra></extra>"
+            )
+            fig.update_layout(yaxis_tickformat=",.2f", margin=dict(t=60))
+            if max_val > 0:
+                fig.update_yaxes(range=[0, max_val * 1.15])
             st.plotly_chart(fig, use_container_width=True)
     
     with col_chart2:

@@ -788,13 +788,37 @@ def salvar_acoes_pdf_parquet(df_acoes: pd.DataFrame, path: str = ACOES_PDF_PATH)
         except Exception:
             existente = pd.DataFrame()
     combinado = pd.concat([existente, df_acoes], ignore_index=True)
-    combinado = combinado.drop_duplicates(
-        subset=["Mês/Ano", "Usuário", "Produto", "Ticker", "Quantidade Disponível"], keep="last"
-    )
     for col in ["Quantidade Disponível", "Preço de Fechamento", "Valor"]:
         if col in combinado.columns:
             combinado[col] = pd.to_numeric(combinado[col], errors="coerce")
+
+    # Normalizações leves
+    if "Ticker" in combinado.columns:
+        combinado["Ticker"] = combinado["Ticker"].astype(str).str.strip().str.upper()
+    if "Produto" in combinado.columns:
+        combinado["Produto"] = combinado["Produto"].astype(str).str.strip()
+
+    # Deduplicação: o PDF às vezes repete a mesma posição com variação de capitalização no nome.
+    # Preferimos o nome com mais letras minúsculas (ex.: "iShares" ao invés de "ISHARES").
+    if "Produto" in combinado.columns:
+        combinado["_produto_score"] = combinado["Produto"].apply(lambda s: sum(1 for ch in str(s) if ch.islower()))
+        combinado = combinado.sort_values(by=["_produto_score"], ascending=False)
+
+    dedup_subset = [c for c in ["Mês/Ano", "Usuário", "Ticker", "Quantidade Disponível", "Preço de Fechamento"] if c in combinado.columns]
+    if dedup_subset:
+        combinado = combinado.drop_duplicates(subset=dedup_subset, keep="first")
+
+    if "_produto_score" in combinado.columns:
+        combinado = combinado.drop(columns=["_produto_score"])
+
     combinado.to_parquet(path)
+
+    # Atualizar cache de Setor/Segmento (yfinance) com tickers Avenue
+    try:
+        from modules.ticker_info import atualizar_cache_por_df
+        atualizar_cache_por_df(combinado)
+    except Exception:
+        pass
     return combinado
 
 

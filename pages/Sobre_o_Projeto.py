@@ -121,6 +121,15 @@ if indice_selecionado == "🏠 Visão Geral":
             st.write(descricao)
     
     st.markdown("---")
+
+    st.subheader("🧭 Abas da Interface")
+    st.markdown("""
+    - **📈 Ações**: Ações BR, Ações Dólar (Avenue) e Ações Consolidadas (BR + Avenue).
+    - **💵 Renda Fixa**: Renda Fixa, Tesouro Direto e Renda Fixa Consolidada.
+    - **💸 Proventos**: Dividendos BR, Dividendos Avenue e Dividendos Consolidados.
+    - **📊 Consolidação**: Visão única com todos os investimentos combinados (BR + Avenue) com filtros, métricas e gráficos de distribuição.
+    - **⚙️ Outros**: Cadastro de usuários e Inserção Manual.
+    """)
     
     st.subheader("🎯 Objetivos do Projeto")
     st.markdown("""
