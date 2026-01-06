@@ -93,7 +93,12 @@ pip install -r requirements.txt
 streamlit run APP.py
 ```
 
-O aplicativo será aberto automaticamente no navegador em `http://localhost:8501`
+**Nota:** O aplicativo abrirá automaticamente no navegador em `http://localhost:8501`. Se não abrir, acesse manualmente essa URL.
+
+Se estiver usando PowerShell com venv ativo:
+```powershell
+streamlit run APP.py
+```
 
 ---
 

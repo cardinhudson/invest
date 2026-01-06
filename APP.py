@@ -5,6 +5,7 @@ from io import BytesIO
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import numpy as np
 from modules.ticker_info import CACHE_PATH as TICKER_INFO_PATH
 
@@ -442,8 +443,16 @@ def gerar_graficos_evolucao(df: pd.DataFrame, coluna_valor: str = "Valor Líquid
             df_group = df.groupby(df[coluna_data].dt.to_period("Y"))[coluna_valor].sum().reindex(idx, fill_value=0)
         df_group.index = df_group.index.astype(str)
 
-        # Gráfico de barras
+        # Gráfico de barras com média móvel
         st.subheader("Gráfico de Barras - Valor Recebido")
+        
+        # Seletor de período para média móvel
+        col_mm1, col_mm2 = st.columns([3, 1])
+        with col_mm1:
+            st.write("")
+        with col_mm2:
+            periodo_mm = st.selectbox("Média Móvel", ["Sem MM", "3 meses", "6 meses", "9 meses", "12 meses"], key=f"{chave_periodo}_mm_selector")
+        
         max_val = df_group.values.max() if len(df_group.values) else 0
         from plotly.colors import sample_colorscale
         blues = px.colors.sequential.Blues[::-1]
@@ -459,6 +468,25 @@ def gerar_graficos_evolucao(df: pd.DataFrame, coluna_valor: str = "Valor Líquid
             color_discrete_sequence=bar_colors
         )
         fig_bar.update_traces(textposition="outside", cliponaxis=False, marker_color=bar_colors)
+        
+        # Adicionar linha de média móvel se selecionada
+        if periodo_mm != "Sem MM":
+            periodo_num = int(periodo_mm.split()[0])
+            mm_values = pd.Series(df_group.values).rolling(window=periodo_num, center=True).mean()
+            fig_bar.add_trace(
+                go.Scatter(
+                    x=df_group.index,
+                    y=mm_values,
+                    mode="lines+markers",
+                    name=f"MM {periodo_num}m",
+                    line=dict(color="red", width=3, dash="dash"),
+                    marker=dict(size=6),
+                    text=[f"{v:.2f}" if not pd.isna(v) else "" for v in mm_values],
+                    textposition="top center"
+                )
+            )
+            fig_bar.update_layout(hovermode="x unified")
+        
         fig_bar.update_layout(yaxis_tickformat=",.2f", xaxis_tickmode="array", xaxis_tickvals=list(df_group.index), xaxis_ticktext=list(df_group.index), margin=dict(t=60))
         if max_val > 0:
             fig_bar.update_yaxes(range=[0, max_val * 1.15])
@@ -540,11 +568,12 @@ def gerar_grafico_top_pagadores(df: pd.DataFrame, coluna_ativo: str = "Ativo", c
         max_val = top_ativos.values.max() if len(top_ativos.values) else 0
         tickers_x = list(top_ativos.index)
         from plotly.colors import sample_colorscale
-        purples = px.colors.sequential.Purples[::-1]
+        # Padrão pedido: quando Mensal, usar azul; quando Anual, manter roxo.
+        paleta = (px.colors.sequential.Blues[::-1] if tipo_periodo == "Mensal" else px.colors.sequential.Purples[::-1])
         n = len(top_ativos)
         valores = np.array(top_ativos.values)
         norm = (valores - valores.min()) / (valores.max() - valores.min()) if valores.max() > valores.min() else np.full(n, 0.5)
-        bar_colors = sample_colorscale(purples, norm)
+        bar_colors = sample_colorscale(paleta, norm)
         fig_top = px.bar(
             x=tickers_x,
             y=top_ativos.values,
@@ -955,6 +984,35 @@ with tab_proventos:
             
             with st.expander("📋 Ver Tabela Completa", expanded=False):
                 st.dataframe(df_dividendos_br, use_container_width=True)
+
+            # Gráfico por fonte (Usuário extraído de Fonte)
+            if "Usuário" in df_dividendos_br.columns and "Valor Líquido" in df_dividendos_br.columns:
+                st.markdown("---")
+                st.subheader("📊 Distribuição por Fonte")
+                dist_fonte_br = (
+                    df_dividendos_br.groupby("Usuário")["Valor Líquido"]
+                    .sum()
+                    .sort_values(ascending=False)
+                )
+                paleta = px.colors.sequential.Blues[::-1]  # maior valor = mais escuro
+                from plotly.colors import sample_colorscale
+                n = len(dist_fonte_br)
+                valores = dist_fonte_br.values
+                norm = (valores - valores.min()) / (valores.max() - valores.min()) if valores.max() > valores.min() else [0.5] * n
+                pie_colors = sample_colorscale(paleta, norm)
+                fig_pie_fonte_br = px.pie(
+                    names=dist_fonte_br.index,
+                    values=dist_fonte_br.values,
+                    title="Distribuição por Fonte",
+                    hole=0.3,
+                    labels={"names": "Fonte", "values": "Valor Líquido"},
+                    color_discrete_sequence=pie_colors,
+                )
+                fig_pie_fonte_br.update_traces(
+                    textinfo="label+percent+value",
+                    texttemplate="%{label}<br>R$%{value:,.2f} (%{percent})",
+                )
+                st.plotly_chart(fig_pie_fonte_br, use_container_width=True, key="div_br_pie_fonte")
             
             # Gráficos de evolução
             st.markdown("---")
@@ -1692,6 +1750,50 @@ with tab_consolidacao:
 
             gerar_graficos_distribuicao(df_view_enriquecido, cores="Blues", key_prefixo="cons_geral")
             exibir_tabela_info_tickers(df_view_enriquecido)
+            
+            # Bloco Top 10 Maiores Altas
+            st.markdown("---")
+            col_up_cons, col_down_cons = st.columns(2)
+            
+            def _plot_bar_azul_cons(df, valor_col, label_col, titulo, key):
+                """Gera gráfico de barras com degrade azul para consolidação"""
+                if df.empty:
+                    st.info("Sem dados.")
+                    return
+                df_plot = df.copy()
+                df_plot = df_plot.sort_values(valor_col, ascending=False).reset_index(drop=True)
+                from plotly.colors import sample_colorscale
+                blues = px.colors.sequential.Blues[::-1]
+                n = len(df_plot)
+                valores = np.array(pd.to_numeric(df_plot[valor_col], errors="coerce"))
+                norm = (valores - valores.min()) / (valores.max() - valores.min()) if valores.max() > valores.min() else np.full(n, 0.5)
+                bar_colors = sample_colorscale(blues, norm)
+                fig = px.bar(
+                    df_plot,
+                    x=label_col,
+                    y=valor_col,
+                    title=titulo,
+                    color=valores,
+                    color_continuous_scale=px.colors.sequential.Blues,
+                    labels={label_col: "Ticker", valor_col: "Valor (R$)"},
+                )
+                fig.update_traces(marker_line_color="rgba(0,0,0,0)", textposition="outside", texttemplate="R$ %{y:,.0f}")
+                fig.update_layout(yaxis_tickformat=",.0f", margin=dict(t=60), coloraxis_showscale=False, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True, key=key)
+            
+            with col_up_cons:
+                st.subheader("📈 Maiores Altas (Top 10)")
+                if "Ticker" in df_view_enriquecido.columns and "Valor" in df_view_enriquecido.columns:
+                    df_top_altas = df_view_enriquecido.nlargest(10, "Valor")[["Ticker", "Valor"]].copy()
+                    _plot_bar_azul_cons(df_top_altas, "Valor", "Ticker", "🏆 Top 10 - Maiores Valores", key="cons_top10_altas")
+                    st.dataframe(df_top_altas, use_container_width=True, hide_index=True)
+            
+            with col_down_cons:
+                st.subheader("📉 Maiores Posições (Top 10)")
+                if "Ticker" in df_view_enriquecido.columns and "Quantidade" in df_view_enriquecido.columns:
+                    df_top_qtd = df_view_enriquecido.nlargest(10, "Quantidade")[["Ticker", "Quantidade"]].copy()
+                    _plot_bar_azul_cons(df_top_qtd, "Quantidade", "Ticker", "🏆 Top 10 - Maior Quantidade", key="cons_top10_qtd")
+                    st.dataframe(df_top_qtd, use_container_width=True, hide_index=True)
 
     with subtab_rentabilidade:
         st.subheader("📈 Rentabilidade (sem aportes)")
@@ -2673,9 +2775,9 @@ with tab_posicao:
                 tipos = df_tmp["Tipo"].dropna().unique()
                 if len(tipos) > 1:
                     st.subheader("Por Tipo")
-                    cols = st.columns(min(len(tipos), 4))
+                    cols = st.columns(min(len(tipos), 5))
                     for idx, tipo in enumerate(sorted(tipos)):
-                        with cols[idx % 4]:
+                        with cols[idx % 5]:
                             tipo_norm = _norm_tipo(tipo)
                             valor_tipo = pd.to_numeric(
                                 df_tmp[df_tmp["_tipo_norm"] == tipo_norm][col_valor],
@@ -2772,7 +2874,7 @@ with tab_posicao:
             df_tab, sty = preparar_tabela_posicao_estilizada(df_view_enriquecido)
             st.dataframe(sty, use_container_width=True, hide_index=True)
 
-        gerar_graficos_distribuicao(df_view_enriquecido, col_valor="Valor", cores="Blues", key_prefixo="posicao_atual")
+        gerar_graficos_distribuicao(df_view_enriquecido, col_valor="Valor", cores="Purples", key_prefixo="posicao_atual")
         exibir_tabela_info_tickers(df_view_enriquecido)
 
         # Exportação

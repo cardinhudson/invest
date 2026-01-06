@@ -1,0 +1,11 @@
+[client]
+showErrorDetails = true
+toolbarMode = "viewer"
+
+[logger]
+level = "error"
+
+[server]
+headless = false
+port = 8501
+runOnSave = true
