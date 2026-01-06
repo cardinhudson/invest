@@ -1,6 +1,7 @@
 import os
 from datetime import datetime
 from io import BytesIO
+import uuid
 from typing import Optional, Tuple
 
 import pandas as pd
@@ -66,7 +67,23 @@ def _parse_num(valor) -> float:
 def carregar_caixa() -> pd.DataFrame:
     if os.path.exists(CAIXA_PATH):
         try:
-            return pd.read_parquet(CAIXA_PATH)
+            df = pd.read_parquet(CAIXA_PATH)
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                return pd.DataFrame()
+            # Migração leve de schema
+            if "Mes" in df.columns and "Mês" not in df.columns:
+                df = df.rename(columns={"Mes": "Mês"})
+            if "Rentabilidade %" in df.columns and "Rentabilidade (%)" not in df.columns:
+                df = df.rename(columns={"Rentabilidade %": "Rentabilidade (%)"})
+            # Garante colunas numéricas principais
+            for col in ["Valor Inicial", "Depósitos", "Saques", "Valor Final", "Rentabilidade (%)", "Ganho"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            if "ID" not in df.columns:
+                df["ID"] = [str(uuid.uuid4()) for _ in range(len(df))]
+            if "Usuário" not in df.columns:
+                df["Usuário"] = "Manual"
+            return df
         except Exception:
             return pd.DataFrame()
     return pd.DataFrame()
@@ -80,29 +97,135 @@ def salvar_caixa(df: pd.DataFrame) -> None:
         pass
 
 
-def registrar_caixa(mes_ano: str, valor_inicial, rentabilidade_pct, usuario: str = "Manual") -> pd.DataFrame:
-    valor = _parse_num(valor_inicial)
-    rent = _parse_num(rentabilidade_pct)
-    if pd.isna(valor) or pd.isna(rent):
-        raise ValueError("Valor e rentabilidade precisam ser numéricos")
-    ganho = valor * (rent / 100.0)
+def calcular_caixa(
+    valor_inicial,
+    depositos,
+    saques,
+    valor_final,
+) -> Tuple[float, float, float, float]:
+    """Calcula rentabilidade do caixa.
+
+    Fórmula:
+      Rentabilidade (%) = ((ValorFinal - soma(depositos) + soma(saques)) - ValorInicial) / ValorInicial * 100
+
+    Retorna: (depositos_total, saques_total, rent_pct, ganho)
+    """
+    vi = _parse_num(valor_inicial)
+    vf = _parse_num(valor_final)
+    if pd.isna(vi) or vi <= 0:
+        raise ValueError("Valor Inicial deve ser maior que zero")
+    if pd.isna(vf):
+        raise ValueError("Valor Final precisa ser numérico")
+
+    dep_total = 0.0
+    if depositos is not None:
+        if isinstance(depositos, (list, tuple, pd.Series, np.ndarray)):
+            dep_total = float(pd.to_numeric(pd.Series(list(depositos)), errors="coerce").fillna(0.0).sum())
+        else:
+            dep_total = float(pd.to_numeric(depositos, errors="coerce") or 0.0)
+
+    saq_total = 0.0
+    if saques is not None:
+        if isinstance(saques, (list, tuple, pd.Series, np.ndarray)):
+            saq_total = float(pd.to_numeric(pd.Series(list(saques)), errors="coerce").fillna(0.0).sum())
+        else:
+            saq_total = float(pd.to_numeric(saques, errors="coerce") or 0.0)
+
+    ganho = (vf - dep_total + saq_total) - vi
+    rent_pct = (ganho / vi) * 100.0
+    return dep_total, saq_total, float(rent_pct), float(ganho)
+
+
+def registrar_caixa(
+    mes_ano: str,
+    valor_inicial,
+    rentabilidade_pct=None,
+    usuario: str = "Manual",
+    depositos=None,
+    saques=None,
+    valor_final=None,
+) -> pd.DataFrame:
+    """Registra Caixa.
+
+    Compatível com dois modos:
+    - Novo: informar valor_inicial, depositos/saques e valor_final (rentabilidade é calculada).
+    - Legado: informar valor_inicial e rentabilidade_pct (ganho = valor_inicial * rent%).
+    """
     mes = str(mes_ano).strip()
+    usr = (usuario or "Manual").strip() or "Manual"
+
     df = carregar_caixa()
-    novo = pd.DataFrame([
-        {
-            "Usuário": usuario or "Manual",
-            "Mes": mes,
-            "Valor Inicial": valor,
-            "Rentabilidade %": rent,
-            "Ganho": ganho,
+
+    # Modo novo (preferencial)
+    if valor_final is not None or depositos is not None or saques is not None:
+        dep_total, saq_total, rent_calc, ganho = calcular_caixa(
+            valor_inicial=valor_inicial,
+            depositos=depositos,
+            saques=saques,
+            valor_final=valor_final,
+        )
+        vi = _parse_num(valor_inicial)
+        vf = _parse_num(valor_final)
+        novo = {
+            "ID": str(uuid.uuid4()),
+            "Usuário": usr,
+            "Mês": mes,
+            "Valor Inicial": float(vi),
+            "Depósitos": float(dep_total),
+            "Saques": float(saq_total),
+            "Valor Final": float(vf),
+            "Rentabilidade (%)": float(rent_calc),
+            "Ganho": float(ganho),
             "Data Registro": datetime.now(),
         }
-    ])
+    else:
+        # Modo legado
+        vi = _parse_num(valor_inicial)
+        rent = _parse_num(rentabilidade_pct)
+        if pd.isna(vi) or pd.isna(rent):
+            raise ValueError("Valor e rentabilidade precisam ser numéricos")
+        ganho = float(vi) * (float(rent) / 100.0)
+        novo = {
+            "ID": str(uuid.uuid4()),
+            "Usuário": usr,
+            "Mês": mes,
+            "Valor Inicial": float(vi),
+            "Depósitos": 0.0,
+            "Saques": 0.0,
+            "Valor Final": float(vi) + float(ganho),
+            "Rentabilidade (%)": float(rent),
+            "Ganho": float(ganho),
+            "Data Registro": datetime.now(),
+        }
+
     # Apenas um registro por mês/usuário: sobrescreve se existir
     if not df.empty:
-        mask = (df["Mes"].astype(str) == mes) & (df["Usuário"].astype(str) == (usuario or "Manual"))
-        df = df[~mask].copy()
-    df_out = pd.concat([df, novo], ignore_index=True)
+        if "Mês" in df.columns:
+            mask = (df["Mês"].astype(str) == mes) & (df["Usuário"].astype(str) == usr)
+            df = df[~mask].copy()
+        elif "Mes" in df.columns:
+            mask = (df["Mes"].astype(str) == mes) & (df["Usuário"].astype(str) == usr)
+            df = df[~mask].copy()
+
+    df_out = pd.concat([df, pd.DataFrame([novo])], ignore_index=True)
+    salvar_caixa(df_out)
+    return df_out
+
+
+def excluir_caixa(ids=None, tudo: bool = False) -> pd.DataFrame:
+    df = carregar_caixa()
+    if df.empty:
+        return df
+    if tudo:
+        df_out = df.iloc[0:0].copy()
+        salvar_caixa(df_out)
+        return df_out
+    if ids is None:
+        return df
+    ids_set = set([str(i) for i in (ids if isinstance(ids, (list, tuple, set, pd.Series, np.ndarray)) else [ids])])
+    if "ID" not in df.columns:
+        return df
+    df_out = df[~df["ID"].astype(str).isin(ids_set)].copy()
     salvar_caixa(df_out)
     return df_out
 
@@ -110,7 +233,12 @@ def registrar_caixa(mes_ano: str, valor_inicial, rentabilidade_pct, usuario: str
 def carregar_acoes() -> pd.DataFrame:
     if os.path.exists(ACOES_PATH):
         try:
-            return pd.read_parquet(ACOES_PATH)
+            df = pd.read_parquet(ACOES_PATH)
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                return pd.DataFrame()
+            if "ID" not in df.columns:
+                df["ID"] = [str(uuid.uuid4()) for _ in range(len(df))]
+            return df
         except Exception:
             return pd.DataFrame()
     return pd.DataFrame()
@@ -201,6 +329,7 @@ def registrar_acao_manual(ticker: str, quantidade, mes_ano: str, usuario: str = 
     df = carregar_acoes()
     novo = pd.DataFrame([
         {
+            "ID": str(uuid.uuid4()),
             "Usuário": usuario or "Manual",
             "Tipo": tipo,
             "Ticker": tnorm,
@@ -230,11 +359,32 @@ def registrar_acao_manual(ticker: str, quantidade, mes_ano: str, usuario: str = 
     return df_out, meta
 
 
+def excluir_acoes(ids=None, tudo: bool = False) -> pd.DataFrame:
+    df = carregar_acoes()
+    if df.empty:
+        return df
+    if tudo:
+        df_out = df.iloc[0:0].copy()
+        salvar_acoes(df_out)
+        return df_out
+    if ids is None:
+        return df
+    ids_set = set([str(i) for i in (ids if isinstance(ids, (list, tuple, set, pd.Series, np.ndarray)) else [ids])])
+    if "ID" not in df.columns:
+        return df
+    df_out = df[~df["ID"].astype(str).isin(ids_set)].copy()
+    salvar_acoes(df_out)
+    return df_out
+
+
 def caixa_para_dividendos(df_caixa: pd.DataFrame) -> pd.DataFrame:
     if df_caixa is None or df_caixa.empty:
         return pd.DataFrame(columns=["Data", "Ativo", "Valor Líquido", "Usuário", "Fonte"])
     dfd = df_caixa.copy()
-    dfd["Data"] = pd.to_datetime("01/" + dfd["Mes"].astype(str), format="%d/%m/%Y", errors="coerce")
+    mes_col = "Mês" if "Mês" in dfd.columns else "Mes" if "Mes" in dfd.columns else None
+    if mes_col is None:
+        return pd.DataFrame(columns=["Data", "Ativo", "Valor Líquido", "Usuário", "Fonte"])
+    dfd["Data"] = pd.to_datetime("01/" + dfd[mes_col].astype(str), format="%d/%m/%Y", errors="coerce")
     dfd = dfd[dfd["Data"].notna()].copy()
     dfd["Ativo"] = "Caixa"
     dfd["Valor Líquido"] = pd.to_numeric(dfd.get("Ganho"), errors="coerce").fillna(0.0)

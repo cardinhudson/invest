@@ -23,6 +23,19 @@ from modules.investimentos_manuais import (
     dataframe_para_excel_bytes as df_manual_para_excel,
 )
 
+# Alguns símbolos foram adicionados recentemente ao módulo; em ambiente Streamlit
+# pode existir cache de import durante hot-reload. Fazemos fallback com reload.
+try:
+    from modules.investimentos_manuais import calcular_caixa, excluir_caixa, excluir_acoes
+except ImportError:
+    import importlib
+    import modules.investimentos_manuais as _im
+
+    _im = importlib.reload(_im)
+    calcular_caixa = _im.calcular_caixa
+    excluir_caixa = _im.excluir_caixa
+    excluir_acoes = _im.excluir_acoes
+
 @st.cache_data(show_spinner=False)
 def carregar_cache_ticker_info():
     if os.path.exists(TICKER_INFO_PATH):
@@ -1852,32 +1865,99 @@ with tab_outros:
                     index=None,
                     key="caixa_usr"
                 )
-            
+
             col_c3, col_c4 = st.columns(2)
             with col_c3:
-                val_caixa = st.number_input(
-                    "Valor Inicial (R$)",
+                val_caixa_ini = st.number_input(
+                    "Valor Inicial do mês (R$)",
                     min_value=0.0,
                     step=100.0,
-                    key="caixa_val"
+                    key="caixa_val_ini"
                 )
             with col_c4:
-                rent_caixa = st.number_input(
-                    "Rentabilidade (%)",
+                val_caixa_fim = st.number_input(
+                    "Valor Final do mês (R$)",
                     min_value=0.0,
-                    step=0.1,
-                    key="caixa_rent"
+                    step=100.0,
+                    key="caixa_val_fim"
                 )
-            
-            if st.button("Registrar Caixa", key="btn_reg_caixa"):
+
+            st.markdown("#### Movimentações no mês")
+            st.caption("Adicione quantos depósitos e saques quiser. O sistema usa a soma de cada um no cálculo.")
+            df_mov_default = pd.DataFrame(
+                [{"Tipo": "Depósito", "Valor": 0.0}],
+                columns=["Tipo", "Valor"],
+            )
+            df_mov = st.data_editor(
+                st.session_state.get("caixa_movs", df_mov_default),
+                num_rows="dynamic",
+                use_container_width=True,
+                key="caixa_movs",
+                column_config={
+                    "Tipo": st.column_config.SelectboxColumn(
+                        "Tipo",
+                        options=["Depósito", "Saque"],
+                        required=True,
+                    ),
+                    "Valor": st.column_config.NumberColumn(
+                        "Valor (R$)",
+                        min_value=0.0,
+                        step=10.0,
+                        format="%.2f",
+                        required=True,
+                    ),
+                },
+            )
+
+            dep_vals = []
+            saq_vals = []
+            try:
+                if isinstance(df_mov, pd.DataFrame) and not df_mov.empty:
+                    tipos = df_mov.get("Tipo", pd.Series(dtype=str)).astype(str)
+                    valores = pd.to_numeric(df_mov.get("Valor", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+                    dep_vals = valores[tipos.str.strip().str.lower().eq("depósito")].tolist()
+                    saq_vals = valores[tipos.str.strip().str.lower().eq("saque")].tolist()
+            except Exception:
+                dep_vals, saq_vals = [], []
+
+            col_calc1, col_calc2 = st.columns(2)
+            with col_calc1:
+                if st.button("Calcular rentabilidade", key="btn_calc_caixa"):
+                    try:
+                        dep_total, saq_total, rent_pct, ganho = calcular_caixa(
+                            valor_inicial=val_caixa_ini,
+                            depositos=dep_vals,
+                            saques=saq_vals,
+                            valor_final=val_caixa_fim,
+                        )
+                        st.session_state["caixa_calc"] = {
+                            "dep_total": dep_total,
+                            "saq_total": saq_total,
+                            "rent_pct": rent_pct,
+                            "ganho": ganho,
+                        }
+                    except Exception as e:
+                        st.error(f"❌ Erro no cálculo: {e}")
+
+            calc = st.session_state.get("caixa_calc", None)
+            if isinstance(calc, dict):
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Depósitos (R$)", f"R$ {calc['dep_total']:,.2f}")
+                c2.metric("Saques (R$)", f"R$ {calc['saq_total']:,.2f}")
+                c3.metric("Ganho (R$)", f"R$ {calc['ganho']:,.2f}")
+                c4.metric("Rentabilidade (%)", f"{calc['rent_pct']:.2f}%")
+
+            if st.button("Salvar mês do Caixa", key="btn_reg_caixa"):
                 try:
                     df_caixa_new = registrar_caixa(
                         mes_caixa,
-                        val_caixa,
-                        rent_caixa,
-                        usuario=usr_caixa or "Manual"
+                        val_caixa_ini,
+                        usuario=usr_caixa or "Manual",
+                        depositos=dep_vals,
+                        saques=saq_vals,
+                        valor_final=val_caixa_fim,
                     )
-                    st.success(f"✅ Caixa registrado para {mes_caixa}")
+                    st.success(f"✅ Caixa salvo para {mes_caixa}")
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ Erro: {e}")
@@ -1886,7 +1966,67 @@ with tab_outros:
             st.subheader("Registros de Caixa")
             df_caixa_view = carregar_caixa()
             if not df_caixa_view.empty:
-                st.dataframe(df_caixa_view, use_container_width=True, hide_index=True)
+                # Exibe histórico com acumulado
+                df_caixa_hist = df_caixa_view.copy()
+                if "Mês" in df_caixa_hist.columns:
+                    df_caixa_hist["Mês"] = df_caixa_hist["Mês"].astype(str)
+                if "Rentabilidade (%)" in df_caixa_hist.columns:
+                    df_caixa_hist["Rentabilidade (%)"] = pd.to_numeric(df_caixa_hist["Rentabilidade (%)"], errors="coerce")
+                    if "Mês" in df_caixa_hist.columns:
+                        df_caixa_hist["_DataMes"] = pd.to_datetime(
+                            "01/" + df_caixa_hist["Mês"].astype(str),
+                            format="%d/%m/%Y",
+                            errors="coerce",
+                        )
+                    if "Usuário" in df_caixa_hist.columns and "_DataMes" in df_caixa_hist.columns:
+                        df_caixa_hist = df_caixa_hist.sort_values(["Usuário", "_DataMes"]).copy()
+                    elif "_DataMes" in df_caixa_hist.columns:
+                        df_caixa_hist = df_caixa_hist.sort_values(["_DataMes"]).copy()
+                    df_caixa_hist["Rentabilidade Acumulada (%)"] = (
+                        (1 + (df_caixa_hist["Rentabilidade (%)"].fillna(0.0) / 100.0)).groupby(df_caixa_hist.get("Usuário", pd.Series(["Manual"]*len(df_caixa_hist)))).cumprod() - 1
+                    ) * 100.0
+                    if "_DataMes" in df_caixa_hist.columns:
+                        df_caixa_hist = df_caixa_hist.drop(columns=["_DataMes"])
+
+                cols_caixa_show = [
+                    c for c in ["Usuário", "Mês", "Valor Inicial", "Depósitos", "Saques", "Valor Final", "Rentabilidade (%)", "Ganho", "Rentabilidade Acumulada (%)"]
+                    if c in df_caixa_hist.columns
+                ]
+                st.dataframe(df_caixa_hist[cols_caixa_show], use_container_width=True, hide_index=True)
+
+                st.markdown("#### Excluir registros")
+                df_del = df_caixa_view.copy()
+                df_del["Excluir"] = False
+                cols_del = [c for c in ["Excluir", "Usuário", "Mês", "Valor Inicial", "Depósitos", "Saques", "Valor Final", "Rentabilidade (%)", "Ganho", "ID"] if c in df_del.columns]
+                df_del_ed = st.data_editor(
+                    df_del[cols_del],
+                    use_container_width=True,
+                    hide_index=True,
+                    disabled=[c for c in cols_del if c != "Excluir"],
+                    key="caixa_del_editor",
+                )
+                col_del1, col_del2 = st.columns(2)
+                with col_del1:
+                    if st.button("🗑️ Excluir selecionados (Caixa)", key="btn_del_caixa"):
+                        try:
+                            ids_del = df_del_ed.loc[df_del_ed["Excluir"] == True, "ID"].astype(str).tolist() if "ID" in df_del_ed.columns else []
+                            if ids_del:
+                                excluir_caixa(ids_del)
+                                st.success("Registros excluídos.")
+                                st.rerun()
+                            else:
+                                st.info("Nenhum registro selecionado.")
+                        except Exception as e:
+                            st.error(f"Erro ao excluir: {e}")
+                with col_del2:
+                    if st.button("🗑️ Excluir TUDO (Caixa)", key="btn_del_caixa_all"):
+                        try:
+                            excluir_caixa(tudo=True)
+                            st.success("Todos os registros de Caixa foram excluídos.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro ao excluir tudo: {e}")
+
                 csv_caixa = df_caixa_view.to_csv(index=False)
                 st.download_button(
                     "📥 CSV Caixa",
@@ -1959,7 +2099,45 @@ with tab_outros:
             st.subheader("Ações Inseridas")
             df_acoes_view = carregar_acoes_man()
             if not df_acoes_view.empty:
-                st.dataframe(df_acoes_view, use_container_width=True, hide_index=True)
+                cols_acoes_show = [
+                    c for c in ["Usuário", "Tipo", "Ticker", "Quantidade", "Preço BRL", "Valor", "Mês/Ano", "Data Registro"]
+                    if c in df_acoes_view.columns
+                ]
+                st.dataframe(df_acoes_view[cols_acoes_show], use_container_width=True, hide_index=True)
+
+                st.markdown("#### Excluir registros")
+                df_del_a = df_acoes_view.copy()
+                df_del_a["Excluir"] = False
+                cols_del_a = [c for c in ["Excluir", "Usuário", "Tipo", "Ticker", "Quantidade", "Preço BRL", "Valor", "Mês/Ano", "ID"] if c in df_del_a.columns]
+                df_del_a_ed = st.data_editor(
+                    df_del_a[cols_del_a],
+                    use_container_width=True,
+                    hide_index=True,
+                    disabled=[c for c in cols_del_a if c != "Excluir"],
+                    key="acoes_del_editor",
+                )
+                col_da1, col_da2 = st.columns(2)
+                with col_da1:
+                    if st.button("🗑️ Excluir selecionados (Ações)", key="btn_del_acoes"):
+                        try:
+                            ids_del = df_del_a_ed.loc[df_del_a_ed["Excluir"] == True, "ID"].astype(str).tolist() if "ID" in df_del_a_ed.columns else []
+                            if ids_del:
+                                excluir_acoes(ids_del)
+                                st.success("Registros excluídos.")
+                                st.rerun()
+                            else:
+                                st.info("Nenhum registro selecionado.")
+                        except Exception as e:
+                            st.error(f"Erro ao excluir: {e}")
+                with col_da2:
+                    if st.button("🗑️ Excluir TUDO (Ações)", key="btn_del_acoes_all"):
+                        try:
+                            excluir_acoes(tudo=True)
+                            st.success("Todos os registros de Ações manuais foram excluídos.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro ao excluir tudo: {e}")
+
                 csv_acoes = df_acoes_view.to_csv(index=False)
                 st.download_button(
                     "📥 CSV Ações",
@@ -1984,10 +2162,11 @@ with tab_outros:
                 
                 consolidado_parts = []
                 if not df_caixa_all.empty:
-                    df_caixa_view_cons = df_caixa_all[[
-                        "Usuário", "Mes", "Valor Inicial", "Rentabilidade %", "Ganho"
-                    ]].copy()
+                    cols_caixa_cons = [c for c in ["Usuário", "Mês", "Valor Inicial", "Depósitos", "Saques", "Valor Final", "Rentabilidade (%)", "Ganho"] if c in df_caixa_all.columns]
+                    df_caixa_view_cons = df_caixa_all[cols_caixa_cons].copy()
                     df_caixa_view_cons["Tipo"] = "Caixa"
+                    if "Mês" in df_caixa_view_cons.columns:
+                        df_caixa_view_cons = df_caixa_view_cons.rename(columns={"Mês": "Mes"})
                     consolidado_parts.append(df_caixa_view_cons)
                 
                 if not df_acoes_all.empty:
@@ -2047,9 +2226,11 @@ with tab_outros:
 ## Inserção Manual
 
 ### 💵 Caixa
-- Registre o valor inicial do caixa no mês e a rentabilidade (%).
-- O sistema calcula o ganho (Valor Inicial × Rentabilidade / 100).
-- O ganho é automaticamente integrado à aba **Rentabilidade** como "Dividendos".
+- Informe o **Valor Inicial** e o **Valor Final** do mês.
+- Adicione quantos **depósitos** e **saques** quiser (movimentações do mês).
+- A rentabilidade é calculada por:
+    - Rentabilidade (%) = ((Valor final - Depósitos + Saques) - Valor inicial) / Valor inicial × 100
+- O **Ganho** do Caixa é automaticamente integrado à aba **Rentabilidade** como "Dividendos" na linha "Caixa".
 
 ### 📈 Ações
 - Insira o ticker (ex: BBAS3, AAPL) e a quantidade.
