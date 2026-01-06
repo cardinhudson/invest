@@ -79,6 +79,33 @@ def carregar_cache_ticker_info():
 st.set_page_config(page_title="Invest - Controle de Investimentos", layout="wide")
 st.title("💰 Invest - Controle de Investimentos")
 
+# Aplica estilo global SUPER AGRESSIVO para reduzir DRASTICAMENTE o tamanho de TODOS os cartões st.metric
+st.markdown("""
+<style>
+/* Reduzir tamanho dos cartões drasticamente */
+[data-testid="stMetric"] {
+  font-size: 0.55rem !important;
+  padding: 0.5rem !important;
+}
+[data-testid="stMetric"] * {
+  font-size: 0.55rem !important;
+}
+[data-testid="stMetric"] label {
+  font-size: 0.55rem !important;
+  margin-bottom: 0.2rem !important;
+}
+[data-testid="stMetricValue"] {
+  font-size: 0.55rem !important;
+}
+[data-testid="stMetricDelta"] {
+  font-size: 0.45rem !important;
+}
+div[data-testid="stMetricValue"] {
+  font-size: 0.55rem !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ========== FUNÇÕES AUXILIARES ==========
 
 @st.cache_data(show_spinner=False)
@@ -225,7 +252,6 @@ def exibir_metricas_valor(df, col_valor="Valor", salvar_no_session_state_key=Non
 
         tipos = df_tmp["Tipo"].dropna().unique()
         if len(tipos) > 1:
-            st.markdown("---")
             st.subheader("Por Tipo")
             cols = st.columns(min(len(tipos), 4))
             for idx, tipo in enumerate(sorted(tipos)):
@@ -258,7 +284,6 @@ def gerar_graficos_distribuicao(df, col_valor="Valor", cores="Blues", key_prefix
     if df.empty or "Tipo" not in df.columns:
         return
     
-    st.markdown("---")
     st.subheader("📊 Distribuição")
     
 
@@ -337,11 +362,12 @@ def gerar_graficos_distribuicao(df, col_valor="Valor", cores="Blues", key_prefix
             max_val = top_ativos.values.max() if len(top_ativos.values) else 0
             tickers_x = [extrair_ticker(a) or str(a) for a in top_ativos.index] if eixo_categoria == "Ativo" else list(top_ativos.index)
             from plotly.colors import sample_colorscale
-            purples = px.colors.sequential.Purples[::-1]  # maior = roxo escuro
+            # Usar a mesma paleta de cores passada como parâmetro (Blues, Greens, Purples, etc)
+            paleta_bar = getattr(px.colors.sequential, cores)[::-1]  # maior = cor mais escura
             n = len(top_ativos)
             valores = np.array(top_ativos.values)
             norm = (valores - valores.min()) / (valores.max() - valores.min()) if valores.max() > valores.min() else np.full(n, 0.5)
-            bar_colors = sample_colorscale(purples[::-1], norm)
+            bar_colors = sample_colorscale(paleta_bar[::-1], norm)
             fig_bar = px.bar(
                 x=tickers_x,
                 y=top_ativos.values,
@@ -2643,9 +2669,9 @@ with tab_posicao:
                 if df_mes_anterior is not None and not df_mes_anterior.empty and "Tipo" in df_mes_anterior.columns:
                     df_prev = df_mes_anterior.copy()
                     df_prev["_tipo_norm"] = df_prev["Tipo"].apply(_norm_tipo)
+
                 tipos = df_tmp["Tipo"].dropna().unique()
                 if len(tipos) > 1:
-                    st.markdown("---")
                     st.subheader("Por Tipo")
                     cols = st.columns(min(len(tipos), 4))
                     for idx, tipo in enumerate(sorted(tipos)):
@@ -2919,10 +2945,14 @@ with tab_outros:
                 st.markdown("---")
                 st.markdown("### 📊 Resultado do Cálculo")
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("💰 Depósitos (R$)", f"R$ {calc['dep_total']:,.2f}")
-                c2.metric("💸 Saques (R$)", f"R$ {calc['saq_total']:,.2f}")
-                c3.metric("📈 Ganho (R$)", f"R$ {calc['ganho']:,.2f}")
-                c4.metric("📊 Rentabilidade (%)", f"{calc['rent_pct']:.2f}%")
+                with c1:
+                    st.metric("💰 Depósitos (R$)", f"R$ {calc['dep_total']:,.2f}")
+                with c2:
+                    st.metric("💸 Saques (R$)", f"R$ {calc['saq_total']:,.2f}")
+                with c3:
+                    st.metric("📈 Ganho (R$)", f"R$ {calc['ganho']:,.2f}")
+                with c4:
+                    st.metric("📊 Rentabilidade (%)", f"{calc['rent_pct']:.2f}%")
                 st.caption(f"**Fórmula:** Rentabilidade (%) = ((Valor Final - Depósitos + Saques) - Valor Inicial) / Valor Inicial × 100")
 
             # Fallback defensivo para evitar NameError caso o Streamlit reordene execução/hot-reload
@@ -3328,4 +3358,12 @@ with tab_outros:
 
 **Nota:** Todos os dados são salvos automaticamente em parquets (formato otimizado para análise de séries temporais).
         """)
+
+# Aplica estilo global para todos os cartões st.metric (reduz 30% o tamanho)
+st.markdown("""
+<style>
+div[data-testid='stMetric'] {font-size: 0.9rem !important;}
+div[data-testid='stMetric'] label, div[data-testid='stMetric'] span {font-size: 0.9rem !important;}
+</style>
+""", unsafe_allow_html=True)
 
