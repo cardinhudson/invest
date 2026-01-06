@@ -79,29 +79,29 @@ def carregar_cache_ticker_info():
 st.set_page_config(page_title="Invest - Controle de Investimentos", layout="wide")
 st.title("💰 Invest - Controle de Investimentos")
 
-# Aplica estilo global SUPER AGRESSIVO para reduzir DRASTICAMENTE o tamanho de TODOS os cartões st.metric
+# Aplica estilo global SUPER AGRESSIVO para aumentar o tamanho de TODOS os cartões st.metric
 st.markdown("""
 <style>
-/* Reduzir tamanho dos cartões drasticamente */
+/* Aumenta o tamanho dos cartões st.metric em 30% (0.72 → 0.936) */
 [data-testid="stMetric"] {
-  font-size: 0.55rem !important;
-  padding: 0.5rem !important;
+    font-size: 0.936rem !important;
+    padding: 0.5rem !important;
 }
 [data-testid="stMetric"] * {
-  font-size: 0.55rem !important;
+    font-size: 0.936rem !important;
 }
 [data-testid="stMetric"] label {
-  font-size: 0.55rem !important;
-  margin-bottom: 0.2rem !important;
+    font-size: 0.936rem !important;
+    margin-bottom: 0.2rem !important;
 }
 [data-testid="stMetricValue"] {
-  font-size: 0.55rem !important;
+    font-size: 0.936rem !important;
 }
 [data-testid="stMetricDelta"] {
-  font-size: 0.45rem !important;
+    font-size: 0.768rem !important;
 }
 div[data-testid="stMetricValue"] {
-  font-size: 0.55rem !important;
+    font-size: 0.936rem !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -253,9 +253,9 @@ def exibir_metricas_valor(df, col_valor="Valor", salvar_no_session_state_key=Non
         tipos = df_tmp["Tipo"].dropna().unique()
         if len(tipos) > 1:
             st.subheader("Por Tipo")
-            cols = st.columns(min(len(tipos), 4))
+            cols = st.columns(min(len(tipos), 5))
             for idx, tipo in enumerate(sorted(tipos)):
-                with cols[idx % 4]:
+                with cols[idx % 5]:
                     tipo_norm = _norm_tipo(tipo)
                     valor_tipo = pd.to_numeric(
                         df_tmp[df_tmp["_tipo_norm"] == tipo_norm][col_valor],
@@ -1690,7 +1690,7 @@ with tab_consolidacao:
             with st.expander("📋 Ver Tabela Completa", expanded=False):
                 st.dataframe(df_view_enriquecido, use_container_width=True)
 
-            gerar_graficos_distribuicao(df_view_enriquecido, cores="Purples", key_prefixo="cons_geral")
+            gerar_graficos_distribuicao(df_view_enriquecido, cores="Blues", key_prefixo="cons_geral")
             exibir_tabela_info_tickers(df_view_enriquecido)
 
     with subtab_rentabilidade:
@@ -2772,7 +2772,7 @@ with tab_posicao:
             df_tab, sty = preparar_tabela_posicao_estilizada(df_view_enriquecido)
             st.dataframe(sty, use_container_width=True, hide_index=True)
 
-        gerar_graficos_distribuicao(df_view_enriquecido, col_valor="Valor", cores="Purples", key_prefixo="posicao_atual")
+        gerar_graficos_distribuicao(df_view_enriquecido, col_valor="Valor", cores="Blues", key_prefixo="posicao_atual")
         exibir_tabela_info_tickers(df_view_enriquecido)
 
         # Exportação
