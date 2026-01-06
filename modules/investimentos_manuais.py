@@ -83,6 +83,9 @@ def carregar_caixa() -> pd.DataFrame:
                 df["ID"] = [str(uuid.uuid4()) for _ in range(len(df))]
             if "Usuário" not in df.columns:
                 df["Usuário"] = "Manual"
+            # Adicionar coluna Nome Caixa se não existir (suporte a múltiplos caixas)
+            if "Nome Caixa" not in df.columns:
+                df["Nome Caixa"] = "Caixa Principal"
             return df
         except Exception:
             return pd.DataFrame()
@@ -144,6 +147,7 @@ def registrar_caixa(
     depositos=None,
     saques=None,
     valor_final=None,
+    nome_caixa: str = "Caixa Principal",
 ) -> pd.DataFrame:
     """Registra Caixa.
 
@@ -153,6 +157,7 @@ def registrar_caixa(
     """
     mes = str(mes_ano).strip()
     usr = (usuario or "Manual").strip() or "Manual"
+    nome_cx = (nome_caixa or "Caixa Principal").strip() or "Caixa Principal"
 
     df = carregar_caixa()
 
@@ -169,6 +174,7 @@ def registrar_caixa(
         novo = {
             "ID": str(uuid.uuid4()),
             "Usuário": usr,
+            "Nome Caixa": nome_cx,
             "Mês": mes,
             "Valor Inicial": float(vi),
             "Depósitos": float(dep_total),
@@ -188,6 +194,7 @@ def registrar_caixa(
         novo = {
             "ID": str(uuid.uuid4()),
             "Usuário": usr,
+            "Nome Caixa": nome_cx,
             "Mês": mes,
             "Valor Inicial": float(vi),
             "Depósitos": 0.0,
@@ -198,13 +205,19 @@ def registrar_caixa(
             "Data Registro": datetime.now(),
         }
 
-    # Apenas um registro por mês/usuário: sobrescreve se existir
+    # Apenas um registro por mês/usuário/nome_caixa: sobrescreve se existir
     if not df.empty:
-        if "Mês" in df.columns:
-            mask = (df["Mês"].astype(str) == mes) & (df["Usuário"].astype(str) == usr)
+        mes_col = "Mês" if "Mês" in df.columns else "Mes" if "Mes" in df.columns else None
+        if mes_col and "Usuário" in df.columns and "Nome Caixa" in df.columns:
+            mask = (
+                (df[mes_col].astype(str) == mes) & 
+                (df["Usuário"].astype(str) == usr) &
+                (df["Nome Caixa"].astype(str) == nome_cx)
+            )
             df = df[~mask].copy()
-        elif "Mes" in df.columns:
-            mask = (df["Mes"].astype(str) == mes) & (df["Usuário"].astype(str) == usr)
+        elif mes_col and "Usuário" in df.columns:
+            # Compatibilidade legado - sobrescreve por mês/usuário
+            mask = (df[mes_col].astype(str) == mes) & (df["Usuário"].astype(str) == usr)
             df = df[~mask].copy()
 
     df_out = pd.concat([df, pd.DataFrame([novo])], ignore_index=True)
@@ -378,6 +391,10 @@ def excluir_acoes(ids=None, tudo: bool = False) -> pd.DataFrame:
 
 
 def caixa_para_dividendos(df_caixa: pd.DataFrame) -> pd.DataFrame:
+    """Converte registros de caixa para formato de dividendos/proventos.
+    
+    Cada caixa aparece como um ativo separado usando o Nome Caixa.
+    """
     if df_caixa is None or df_caixa.empty:
         return pd.DataFrame(columns=["Data", "Ativo", "Valor Líquido", "Usuário", "Fonte"])
     dfd = df_caixa.copy()
@@ -386,7 +403,8 @@ def caixa_para_dividendos(df_caixa: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["Data", "Ativo", "Valor Líquido", "Usuário", "Fonte"])
     dfd["Data"] = pd.to_datetime("01/" + dfd[mes_col].astype(str), format="%d/%m/%Y", errors="coerce")
     dfd = dfd[dfd["Data"].notna()].copy()
-    dfd["Ativo"] = "Caixa"
+    # Usar Nome Caixa como identificador do ativo
+    dfd["Ativo"] = dfd.get("Nome Caixa", "Caixa").fillna("Caixa")
     dfd["Valor Líquido"] = pd.to_numeric(dfd.get("Ganho"), errors="coerce").fillna(0.0)
     dfd["Usuário"] = dfd.get("Usuário", "Manual").fillna("Manual")
     dfd["Fonte"] = "Manual Caixa"
@@ -404,6 +422,35 @@ def acoes_para_consolidado(df_acoes: pd.DataFrame) -> pd.DataFrame:
         df["Mês/Ano"] = None
     df["Tipo"] = df.get("Tipo", "Ações")
     df["Usuário"] = df.get("Usuário", "Manual").fillna("Manual")
+    cols = [c for c in ["Ativo", "Ticker", "Quantidade", "Preço", "Valor", "Tipo", "Usuário", "Mês/Ano"] if c in df.columns]
+    return df[cols]
+
+
+def caixa_para_consolidado(df_caixa: pd.DataFrame) -> pd.DataFrame:
+    """Converte registros de caixa para formato de consolidado (tabs de investimento).
+    
+    Cada caixa aparece como Tipo='Caixa' com Nome Caixa como identificador.
+    """
+    if df_caixa is None or df_caixa.empty:
+        return pd.DataFrame()
+    df = df_caixa.copy()
+    
+    # Usar Nome Caixa como Ativo
+    df["Ativo"] = df.get("Nome Caixa", "Caixa").fillna("Caixa")
+    df["Ticker"] = df["Ativo"]  # Ticker = Nome Caixa para consistência
+    df["Quantidade"] = 1.0  # Caixa sempre tem quantidade 1
+    df["Preço"] = df.get("Valor Final", 0.0)  # Preço = Valor Final do mês
+    df["Valor"] = df.get("Valor Final", 0.0)
+    df["Tipo"] = "Caixa"
+    df["Usuário"] = df.get("Usuário", "Manual").fillna("Manual")
+    
+    # Converter Mês (MM/YYYY) para Mês/Ano
+    mes_col = "Mês" if "Mês" in df.columns else "Mes" if "Mes" in df.columns else None
+    if mes_col:
+        df["Mês/Ano"] = df[mes_col].astype(str)
+    else:
+        df["Mês/Ano"] = None
+    
     cols = [c for c in ["Ativo", "Ticker", "Quantidade", "Preço", "Valor", "Tipo", "Usuário", "Mês/Ano"] if c in df.columns]
     return df[cols]
 

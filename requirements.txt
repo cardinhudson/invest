@@ -53,3 +53,9 @@ websockets==15.0.1
 yfinance==1.0
 openpyxl==3.1.5
 
+# Necessário para `pandas.read_html` (scraping de tabelas HTML)
+lxml
+
+# Algumas páginas retornam HTML que exige html5lib
+html5lib
+
