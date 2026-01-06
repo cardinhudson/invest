@@ -1,5 +1,7 @@
 import os
 import json
+from datetime import datetime
+from io import BytesIO
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -9,7 +11,17 @@ from modules.ticker_info import CACHE_PATH as TICKER_INFO_PATH
 from modules.usuarios import carregar_usuarios, salvar_usuarios
 from modules.upload_relatorio import ACOES_PATH, RENDA_FIXA_PATH, PROVENTOS_PATH, padronizar_tabelas, padronizar_dividendos
 from modules.avenue_views import aba_acoes_avenue, aba_proventos_avenue, padronizar_dividendos_avenue, carregar_dividendos_avenue, padronizar_acoes_avenue, carregar_acoes_avenue
-from modules.cotacoes import converter_usd_para_brl
+from modules.cotacoes import converter_usd_para_brl, obter_historico_indice
+from modules.posicao_atual import preparar_posicao_base, atualizar_cotacoes, dataframe_para_excel_bytes, preparar_tabela_posicao_estilizada
+from modules.investimentos_manuais import (
+    carregar_caixa,
+    registrar_caixa,
+    carregar_acoes as carregar_acoes_man,
+    registrar_acao_manual,
+    caixa_para_dividendos,
+    acoes_para_consolidado,
+    dataframe_para_excel_bytes as df_manual_para_excel,
+)
 
 @st.cache_data(show_spinner=False)
 def carregar_cache_ticker_info():
@@ -58,11 +70,28 @@ def aplicar_filtros_padrao(df, chave_prefixo="filtro"):
         mes_sel = st.selectbox("Mês/Ano", meses, index=len(meses)-1 if meses else 0, key=f"{chave_prefixo}_mes") if meses else None
     
     with cols[1]:
-        usuarios_sel = st.multiselect("Usuário", usuarios, default=usuarios, key=f"{chave_prefixo}_user") if usuarios else []
+        usuarios_opcoes = ["Todos"] + usuarios if usuarios else []
+        usuarios_sel = st.multiselect(
+            "Usuário",
+            usuarios_opcoes,
+            default=["Todos"] if usuarios else [],
+            key=f"{chave_prefixo}_user"
+        ) if usuarios else []
+        # Se "Todos" está selecionado, seleciona todos
+        if "Todos" in usuarios_sel:
+            usuarios_sel = usuarios
     
     with cols[2]:
         if tipos and len(tipos) > 1:
-            tipos_sel = st.multiselect("Tipo", tipos, default=tipos, key=f"{chave_prefixo}_tipo")
+            tipos_opcoes = ["Todos"] + tipos
+            tipos_sel = st.multiselect(
+                "Tipo",
+                tipos_opcoes,
+                default=["Todos"] if tipos else [],
+                key=f"{chave_prefixo}_tipo"
+            )
+            if "Todos" in tipos_sel:
+                tipos_sel = tipos
         else:
             tipos_sel = tipos
     
@@ -177,9 +206,11 @@ def gerar_graficos_distribuicao(df, col_valor="Valor", cores="Blues", key_prefix
             max_val = top_ativos.values.max() if len(top_ativos.values) else 0
             tickers_x = [extrair_ticker(a) or str(a) for a in top_ativos.index] if eixo_categoria == "Ativo" else list(top_ativos.index)
             from plotly.colors import sample_colorscale
-            blues = px.colors.sequential.Blues[::-1]  # maior = azul escuro
+            blues = px.colors.sequential.Blues  # maior = azul escuro
             n = len(top_ativos)
-            bar_colors = sample_colorscale(blues, [i/(n-1) if n>1 else 0 for i in range(n)])
+            valores = np.array(top_ativos.values)
+            norm = (valores - valores.min()) / (valores.max() - valores.min()) if valores.max() > valores.min() else np.full(n, 0.5)
+            bar_colors = sample_colorscale(blues[::-1], norm)
             fig_bar = px.bar(
                 x=tickers_x,
                 y=top_ativos.values,
@@ -260,7 +291,9 @@ def gerar_graficos_evolucao(df: pd.DataFrame, coluna_valor: str = "Valor Líquid
         from plotly.colors import sample_colorscale
         blues = px.colors.sequential.Blues[::-1]
         n = len(df_group)
-        bar_colors = sample_colorscale(blues, [i/(n-1) if n>1 else 0 for i in range(n)])
+        valores = np.array(df_group.values)
+        norm = (valores - valores.min()) / (valores.max() - valores.min()) if valores.max() > valores.min() else np.full(n, 0.5)
+        bar_colors = sample_colorscale(blues, norm)
         fig_bar = px.bar(
             x=df_group.index,
             y=df_group.values,
@@ -352,7 +385,9 @@ def gerar_grafico_top_pagadores(df: pd.DataFrame, coluna_ativo: str = "Ativo", c
         from plotly.colors import sample_colorscale
         blues = px.colors.sequential.Blues[::-1]
         n = len(top_ativos)
-        bar_colors = sample_colorscale(blues, [i/(n-1) if n>1 else 0 for i in range(n)])
+        valores = np.array(top_ativos.values)
+        norm = (valores - valores.min()) / (valores.max() - valores.min()) if valores.max() > valores.min() else np.full(n, 0.5)
+        bar_colors = sample_colorscale(blues, norm)
         fig_top = px.bar(
             x=tickers_x,
             y=top_ativos.values,
@@ -434,6 +469,11 @@ if not df_dividendos_br.empty and "Fonte" in df_dividendos_br.columns:
     df_dividendos_br["Usuário"] = df_dividendos_br["Usuário"].fillna("Não informado")
 
 df_dividendos_avenue = padronizar_dividendos_avenue(df_dividendos_avenue_raw) if not df_dividendos_avenue_raw.empty else pd.DataFrame()
+
+# Dados manuais (caixa e ações)
+df_manual_caixa = carregar_caixa()
+df_manual_acoes = carregar_acoes_man()
+df_dividendos_caixa = caixa_para_dividendos(df_manual_caixa)
 
 # Converter dividendos Avenue para BRL
 if not df_dividendos_avenue.empty:
@@ -558,7 +598,8 @@ def enriquecer_com_setor_segmento(df):
 
 df_dividendos_br_cons = preparar_dividendos_consolidado(df_dividendos_br, "Proventos Gerais")
 df_dividendos_avenue_cons = preparar_dividendos_consolidado(df_dividendos_avenue, "Proventos Avenue")
-df_dividendos_consolidado = pd.concat([df_dividendos_br_cons, df_dividendos_avenue_cons], ignore_index=True)
+df_dividendos_caixa_cons = preparar_dividendos_consolidado(df_dividendos_caixa, "Manual Caixa")
+df_dividendos_consolidado = pd.concat([df_dividendos_br_cons, df_dividendos_avenue_cons, df_dividendos_caixa_cons], ignore_index=True)
 
 # Separar por tipo
 df_acoes_br = df_padronizado[df_padronizado["Tipo"] == "Ações"].copy() if not df_padronizado.empty else pd.DataFrame()
@@ -567,11 +608,12 @@ df_tesouro = df_padronizado[df_padronizado["Tipo"] == "Tesouro Direto"].copy() i
 
 # ========== INTERFACE COM TABS REORGANIZADAS ==========
 
-tab_acoes, tab_renda_fixa, tab_proventos, tab_consolidacao, tab_outros = st.tabs([
+tab_acoes, tab_renda_fixa, tab_proventos, tab_consolidacao, tab_posicao, tab_outros = st.tabs([
     "📈 Ações",
     "💵 Renda Fixa",
     "💸 Proventos",
     "📊 Consolidação",
+    "📌 Posição Atual",
     "⚙️ Outros"
 ])
 
@@ -777,14 +819,19 @@ with tab_proventos:
                     usuarios = sorted(df_filtrado["Usuário"].dropna().unique())
                     usuarios_sel = st.multiselect("Usuário", usuarios, default=usuarios, key="div_cons_user")
                     if usuarios_sel:
+                        if "Todos" in usuarios_sel:
+                            usuarios_sel = usuarios
                         df_filtrado = df_filtrado[df_filtrado["Usuário"].isin(usuarios_sel)]
             
             with col_f3:
                 if "Ativo" in df_filtrado.columns:
                     ativos = sorted(df_filtrado["Ativo"].dropna().unique())
                     if len(ativos) > 0:
-                        ativos_sel = st.multiselect("Ativo", ativos, key="div_cons_ativo")
+                        ativos_opcoes = ["Todos"] + ativos
+                        ativos_sel = st.multiselect("Ativo", ativos_opcoes, default=["Todos"], key="div_cons_ativo")
                         if ativos_sel:
+                            if "Todos" in ativos_sel:
+                                ativos_sel = ativos
                             df_filtrado = df_filtrado[df_filtrado["Ativo"].isin(ativos_sel)]
             
             with st.expander("📋 Ver Tabela Completa", expanded=False):
@@ -1012,14 +1059,15 @@ with tab_consolidacao:
 
             dfp = df_cons.copy()
 
-            # Quantidade: para BR vem em "Quantidade Disponível", para Avenue em "Quantidade".
+            # Quantidade: para patrimônio, preferir "Quantidade". Manter fallback para "Quantidade Disponível"
+            # pois alguns relatórios/formatos antigos só trazem a coluna disponível.
             # Como o consolidado contém a união das colunas, a decisão precisa ser por-linha.
-            qtd = dfp["Quantidade Disponível"] if "Quantidade Disponível" in dfp.columns else None
+            qtd = dfp["Quantidade"] if "Quantidade" in dfp.columns else None
             if qtd is None:
-                qtd = dfp["Quantidade"] if "Quantidade" in dfp.columns else 0.0
+                qtd = dfp["Quantidade Disponível"] if "Quantidade Disponível" in dfp.columns else 0.0
             else:
-                if "Quantidade" in dfp.columns:
-                    qtd = qtd.where(qtd.notna(), dfp["Quantidade"])
+                if "Quantidade Disponível" in dfp.columns:
+                    qtd = qtd.where(qtd.notna(), dfp["Quantidade Disponível"])
             dfp["Quantidade"] = qtd
             dfp["Quantidade"] = dfp["Quantidade"].apply(_parse_num_misto)
             dfp["Quantidade"] = pd.to_numeric(dfp["Quantidade"], errors="coerce").fillna(0.0)
@@ -1245,17 +1293,24 @@ with tab_consolidacao:
 
                 col_f1, col_f2, col_f3 = st.columns(3)
                 with col_f1:
-                    usuarios_sel = st.multiselect("Usuário", usuarios_disp, default=usuarios_disp, key="rentab_usuarios")
+                    usuarios_opcoes = ["Todos"] + usuarios_disp
+                    usuarios_sel = st.multiselect("Usuário", usuarios_opcoes, default=["Todos"], key="rentab_usuarios")
+                    if "Todos" in usuarios_sel:
+                        usuarios_sel = usuarios_disp
                 with col_f2:
-                    tipos_sel = st.multiselect("Tipo", tipos_disp, default=tipos_disp, key="rentab_tipos")
+                    tipos_opcoes = ["Todos"] + tipos_disp
+                    tipos_sel = st.multiselect("Tipo", tipos_opcoes, default=["Todos"], key="rentab_tipos")
+                    if "Todos" in tipos_sel:
+                        tipos_sel = tipos_disp
                 with col_f3:
                     modo_vis = st.selectbox("Visualização", ["Total (Carteira)", "Por Ativo"], index=0, key="rentab_modo")
 
-                col_a1, col_a2 = st.columns(2)
+                col_a1, _col_a2 = st.columns(2)
                 with col_a1:
-                    ativos_sel = st.multiselect("Ativo/Ticker", ativos_disp, default=ativos_disp, key="rentab_ativos")
-                with col_a2:
-                    freq_sel = st.selectbox("Período (Rentabilidade)", ["Mensal", "Bimestral", "Trimestral", "Semestral", "Anual"], index=0, key="rentab_freq")
+                    ativos_opcoes = ["Todos"] + ativos_disp
+                    ativos_sel = st.multiselect("Ativo/Ticker", ativos_opcoes, default=["Todos"], key="rentab_ativos")
+                    if "Todos" in ativos_sel:
+                        ativos_sel = ativos_disp
 
                 base_f = base.copy()
                 if usuarios_sel:
@@ -1288,7 +1343,13 @@ with tab_consolidacao:
                     from plotly.colors import sample_colorscale
                     greens = px.colors.sequential.Greens
                     n_bars = len(df_patr)
-                    bar_colors = sample_colorscale(greens, [i/(n_bars-1) if n_bars>1 else 0 for i in range(n_bars)])
+                    # Ordena os valores para mapear o degradê corretamente
+                    valores = df_patr["Valor"].values
+                    ordem = valores.argsort()
+                    # Gera um array de posições normalizadas para o degradê
+                    norm = (valores - valores.min()) / (valores.max() - valores.min()) if valores.max() > valores.min() else [0.5]*n_bars
+                    # Aplica o degradê: menor valor = verde claro, maior = verde escuro
+                    bar_colors = sample_colorscale(greens, norm)
 
                     fig_patr = px.bar(
                         x=df_patr["Label"],
@@ -1304,79 +1365,441 @@ with tab_consolidacao:
                 # ===== Rentabilidade (juros compostos a partir da base mensal por ativo) =====
                 st.markdown("---")
                 st.subheader("📈 Rentabilidade")
+                freq_sel = st.selectbox(
+                    "Período (Rentabilidade)",
+                    ["Mensal", "Bimestral", "Trimestral", "Semestral", "Anual"],
+                    index=0,
+                    key="rentab_freq"
+                )
 
-                if base_f.empty:
-                    st.info("Sem dados após filtros.")
+                modo_retorno = st.radio(
+                    "Retorno exibido",
+                    ["Com dividendos", "Sem dividendos"],
+                    index=0,
+                    horizontal=True,
+                    key="rentab_modo_retorno",
+                )
+                usar_dividendos = modo_retorno == "Com dividendos"
+                sufixo_retorno = "com dividendos" if usar_dividendos else "sem dividendos"
+
+                st.markdown("#### Seleção de Usuários para o Gráfico")
+                if modo_vis == "Total (Carteira)":
+                    mensal = base_f.groupby(["Usuário", "PeriodoStr"], as_index=False).agg(
+                        ValorInicial=("ValorInicial", "sum"),
+                        ValorFinal=("ValorFinal", "sum"),
+                        Dividendos=("Dividendos", "sum"),
+                    )
+                    mensal["RetornoPct"] = np.where(
+                        mensal["ValorInicial"] > 0,
+                        ((mensal["ValorFinal"] + (mensal["Dividendos"] if usar_dividendos else 0.0)) - mensal["ValorInicial"]) / mensal["ValorInicial"] * 100.0,
+                        np.nan,
+                    )
+                    mensal = mensal.rename(columns={"Usuário": "Serie"})
+
+                    # Total (todos usuários selecionados)
+                    total = mensal.groupby(["PeriodoStr"], as_index=False).agg(
+                        ValorInicial=("ValorInicial", "sum"),
+                        ValorFinal=("ValorFinal", "sum"),
+                        Dividendos=("Dividendos", "sum"),
+                    )
+                    total["RetornoPct"] = np.where(
+                        total["ValorInicial"] > 0,
+                        ((total["ValorFinal"] + (total["Dividendos"] if usar_dividendos else 0.0)) - total["ValorInicial"]) / total["ValorInicial"] * 100.0,
+                        np.nan,
+                    )
+                    total["Serie"] = "Total"
+                    mensal = pd.concat([mensal, total], ignore_index=True)
+                    series_disponiveis = sorted(mensal["Serie"].unique(), key=lambda x: (x != "Total", x))
                 else:
-                    # mensal: agregação depende do modo
-                    if modo_vis == "Total (Carteira)":
-                        mensal = base_f.groupby(["Usuário", "PeriodoStr"], as_index=False).agg(
-                            ValorInicial=("ValorInicial", "sum"),
-                            ValorFinal=("ValorFinal", "sum"),
-                            Dividendos=("Dividendos", "sum"),
-                        )
-                        mensal["RetornoPct"] = np.where(
-                            mensal["ValorInicial"] > 0,
-                            ((mensal["ValorFinal"] + mensal["Dividendos"]) - mensal["ValorInicial"]) / mensal["ValorInicial"] * 100.0,
-                            np.nan,
-                        )
-                        mensal = mensal.rename(columns={"Usuário": "Serie"})
+                    mensal = base_f.groupby(["Chave", "PeriodoStr"], as_index=False).agg(
+                        ValorInicial=("ValorInicial", "sum"),
+                        ValorFinal=("ValorFinal", "sum"),
+                        Dividendos=("Dividendos", "sum"),
+                    )
+                    mensal["RetornoPct"] = np.where(
+                        mensal["ValorInicial"] > 0,
+                        ((mensal["ValorFinal"] + (mensal["Dividendos"] if usar_dividendos else 0.0)) - mensal["ValorInicial"]) / mensal["ValorInicial"] * 100.0,
+                        np.nan,
+                    )
+                    mensal = mensal.rename(columns={"Chave": "Serie"})
+                    series_disponiveis = sorted(mensal["Serie"].unique())
 
-                        # Total (todos usuários selecionados)
-                        total = mensal.groupby(["PeriodoStr"], as_index=False).agg(
-                            ValorInicial=("ValorInicial", "sum"),
-                            ValorFinal=("ValorFinal", "sum"),
-                            Dividendos=("Dividendos", "sum"),
-                        )
-                        total["RetornoPct"] = np.where(
-                            total["ValorInicial"] > 0,
-                            ((total["ValorFinal"] + total["Dividendos"]) - total["ValorInicial"]) / total["ValorInicial"] * 100.0,
-                            np.nan,
-                        )
-                        total["Serie"] = "Total"
-                        mensal = pd.concat([mensal, total], ignore_index=True)
-                    else:
-                        mensal = base_f.groupby(["Chave", "PeriodoStr"], as_index=False).agg(
-                            ValorInicial=("ValorInicial", "sum"),
-                            ValorFinal=("ValorFinal", "sum"),
-                            Dividendos=("Dividendos", "sum"),
-                        )
-                        mensal["RetornoPct"] = np.where(
-                            mensal["ValorInicial"] > 0,
-                            ((mensal["ValorFinal"] + mensal["Dividendos"]) - mensal["ValorInicial"] ) / mensal["ValorInicial"] * 100.0,
-                            np.nan,
-                        )
-                        mensal = mensal.rename(columns={"Chave": "Serie"})
+                # Caixa de seleção de séries (usuários ou ativos)
+                series_opcoes = ["Total"] + [s for s in series_disponiveis if s != "Total"]
+                series_sel = st.multiselect(
+                    "Usuários/Séries exibidas no gráfico",
+                    options=series_opcoes,
+                    default=series_opcoes,
+                    key="rentab_series_grafico"
+                )
+                # Filtra as séries selecionadas
+                df_plot = _agregar_composto(mensal, freq_sel, group_col="Serie")
+                df_plot = df_plot[df_plot["PeriodoEnd"].notna()].sort_values(["PeriodoEnd", "Serie"]).copy()
+                df_plot = df_plot[df_plot["Serie"].isin(series_sel)]
 
-                    df_plot = _agregar_composto(mensal, freq_sel, group_col="Serie")
-                    df_plot = df_plot[df_plot["PeriodoEnd"].notna()].sort_values(["PeriodoEnd", "Serie"]).copy()
+                # Aplica os mesmos filtros de seleção do gráfico na tabela base mensal
+                base_tbl = base_f.copy()
+                if modo_vis == "Total (Carteira)":
+                    usuarios_graf = [s for s in series_sel if s != "Total"]
+                    if usuarios_graf:
+                        base_tbl = base_tbl[base_tbl["Usuário"].isin(usuarios_graf)]
+                else:
+                    series_graf = [s for s in series_sel if s != "Total"]
+                    if series_graf:
+                        base_tbl = base_tbl[base_tbl["Chave"].isin(series_graf)]
 
-                    fig = px.line(
-                        df_plot,
+                # Ajusta RetornoPct exibido na base mensal conforme modo (com/sem dividendos)
+                if "ValorInicial" in base_tbl.columns and "ValorFinal" in base_tbl.columns:
+                    base_tbl["RetornoPct"] = np.where(
+                        pd.to_numeric(base_tbl["ValorInicial"], errors="coerce") > 0,
+                        (
+                            (
+                                pd.to_numeric(base_tbl["ValorFinal"], errors="coerce")
+                                + (pd.to_numeric(base_tbl["Dividendos"], errors="coerce") if usar_dividendos and "Dividendos" in base_tbl.columns else 0.0)
+                            )
+                            - pd.to_numeric(base_tbl["ValorInicial"], errors="coerce")
+                        )
+                        / pd.to_numeric(base_tbl["ValorInicial"], errors="coerce")
+                        * 100.0,
+                        np.nan,
+                    )
+
+                # Rótulos apenas para a série Total (1 casa decimal)
+                df_plot["text"] = np.where(
+                    df_plot["Serie"] == "Total",
+                    df_plot["RetornoPct"].round(1).astype(str) + "%",
+                    None,
+                )
+
+                fig = px.line(
+                    df_plot,
+                    x="Label",
+                    y="RetornoPct",
+                    color="Serie",
+                    markers=True,
+                    labels={"Label": "Período", "RetornoPct": "Rentabilidade (%)"},
+                    title=f"Rentabilidade {freq_sel} (juros compostos) — {sufixo_retorno}",
+                    text="text",
+                )
+                fig.update_traces(textposition="top center")
+                fig.update_layout(margin=dict(t=60))
+                st.plotly_chart(fig, use_container_width=True, key="rentab_chart")
+
+                # Gráfico de rentabilidade acumulada (juros compostos)
+                if not df_plot.empty:
+                    df_acum = []
+                    for serie, grp in df_plot.groupby("Serie"):
+                        grp_sorted = grp.sort_values("PeriodoEnd").copy()
+                        fator = (1 + pd.to_numeric(grp_sorted["RetornoPct"], errors="coerce") / 100.0).cumprod()
+                        grp_sorted["RetornoAcumPct"] = (fator - 1.0) * 100.0
+                        df_acum.append(grp_sorted)
+                    df_acum = pd.concat(df_acum, ignore_index=True) if df_acum else pd.DataFrame()
+
+                    fig_acum = px.line(
+                        df_acum,
                         x="Label",
-                        y="RetornoPct",
+                        y="RetornoAcumPct",
                         color="Serie",
                         markers=True,
-                        labels={"Label": "Período", "RetornoPct": "Rentabilidade (%)"},
-                        title=f"Rentabilidade {freq_sel} (juros compostos)"
+                        labels={"Label": "Período", "RetornoAcumPct": "Rentabilidade Acumulada (%)"},
+                        title=f"Rentabilidade Acumulada {freq_sel} (juros compostos) — {sufixo_retorno}",
                     )
-                    fig.update_layout(margin=dict(t=60))
-                    st.plotly_chart(fig, use_container_width=True, key="rentab_chart")
+                    fig_acum.update_layout(margin=dict(t=60))
+                    st.plotly_chart(fig_acum, use_container_width=True, key="rentab_chart_acum")
 
-                    with st.expander("📋 Ver base mensal (ativo x mês)", expanded=False):
-                        cols_show = [
-                            "Usuário", "Tipo", "Chave", "MesAno",
-                            "QuantidadeAnterior", "QuantidadeAtual", "QuantidadeBase",
-                            "PrecoAnterior", "PrecoAtual", "ValorInicial", "ValorFinal",
-                            "Dividendos", "RetornoPct",
-                        ]
-                        cols_show = [c for c in cols_show if c in base_f.columns]
-                        st.dataframe(base_f[cols_show], use_container_width=True, hide_index=True)
+                # ===== Rentabilidade por Tipo de Investimento =====
+                st.markdown("---")
+                st.subheader("📊 Rentabilidade por Tipo de Investimento")
+                
+                freq_tipo = st.selectbox(
+                    "Período (Rentabilidade por Tipo)",
+                    ["Mensal", "Bimestral", "Trimestral", "Semestral", "Anual"],
+                    index=0,
+                    key="rentab_freq_tipo"
+                )
+                
+                # Agrupa por Tipo ao invés de Usuário
+                mensal_tipo = base_f.groupby(["Tipo", "PeriodoStr"], as_index=False).agg(
+                    ValorInicial=("ValorInicial", "sum"),
+                    ValorFinal=("ValorFinal", "sum"),
+                    Dividendos=("Dividendos", "sum"),
+                )
+                mensal_tipo["RetornoPct"] = np.where(
+                    mensal_tipo["ValorInicial"] > 0,
+                    ((mensal_tipo["ValorFinal"] + (mensal_tipo["Dividendos"] if usar_dividendos else 0.0)) - mensal_tipo["ValorInicial"]) / mensal_tipo["ValorInicial"] * 100.0,
+                    np.nan,
+                )
+                mensal_tipo = mensal_tipo.rename(columns={"Tipo": "Serie"})
+                
+                # Total (todos tipos)
+                total_tipo = mensal_tipo.groupby(["PeriodoStr"], as_index=False).agg(
+                    ValorInicial=("ValorInicial", "sum"),
+                    ValorFinal=("ValorFinal", "sum"),
+                    Dividendos=("Dividendos", "sum"),
+                )
+                total_tipo["RetornoPct"] = np.where(
+                    total_tipo["ValorInicial"] > 0,
+                    ((total_tipo["ValorFinal"] + (total_tipo["Dividendos"] if usar_dividendos else 0.0)) - total_tipo["ValorInicial"]) / total_tipo["ValorInicial"] * 100.0,
+                    np.nan,
+                )
+                total_tipo["Serie"] = "Total"
+                mensal_tipo = pd.concat([mensal_tipo, total_tipo], ignore_index=True)
+                
+                # Filtra as séries selecionadas
+                df_plot_tipo = _agregar_composto(mensal_tipo, freq_tipo, group_col="Serie")
+                df_plot_tipo = df_plot_tipo[df_plot_tipo["PeriodoEnd"].notna()].sort_values(["PeriodoEnd", "Serie"]).copy()
+                
+                tipos_unicos = sorted([t for t in df_plot_tipo["Serie"].unique() if t != "Total"])
+                series_opcoes_tipo = ["Total"] + tipos_unicos
+                series_sel_tipo = st.multiselect(
+                    "Tipos de investimento exibidos no gráfico",
+                    options=series_opcoes_tipo,
+                    default=series_opcoes_tipo,
+                    key="rentab_series_tipo"
+                )
+                df_plot_tipo = df_plot_tipo[df_plot_tipo["Serie"].isin(series_sel_tipo)]
+                
+                # Rótulos apenas para Total
+                df_plot_tipo["text"] = np.where(
+                    df_plot_tipo["Serie"] == "Total",
+                    df_plot_tipo["RetornoPct"].round(1).astype(str) + "%",
+                    None,
+                )
+                
+                # Gráfico de rentabilidade por tipo (mensal)
+                fig_tipo = px.line(
+                    df_plot_tipo,
+                    x="Label",
+                    y="RetornoPct",
+                    color="Serie",
+                    markers=True,
+                    labels={"Label": "Período", "RetornoPct": "Rentabilidade (%)"},
+                    title=f"Rentabilidade Mensal por Tipo (juros compostos) — {sufixo_retorno}",
+                    text="text",
+                )
+                fig_tipo.update_traces(textposition="top center")
+                fig_tipo.update_layout(margin=dict(t=60))
+                st.plotly_chart(fig_tipo, use_container_width=True, key="rentab_chart_tipo")
+                
+                # Gráfico de rentabilidade acumulada por tipo
+                if not df_plot_tipo.empty:
+                    df_acum_tipo = []
+                    for serie, grp in df_plot_tipo.groupby("Serie"):
+                        grp_sorted = grp.sort_values("PeriodoEnd").copy()
+                        fator = (1 + pd.to_numeric(grp_sorted["RetornoPct"], errors="coerce") / 100.0).cumprod()
+                        grp_sorted["RetornoAcumPct"] = (fator - 1.0) * 100.0
+                        df_acum_tipo.append(grp_sorted)
+                    df_acum_tipo = pd.concat(df_acum_tipo, ignore_index=True) if df_acum_tipo else pd.DataFrame()
+                    
+                    fig_acum_tipo = px.line(
+                        df_acum_tipo,
+                        x="Label",
+                        y="RetornoAcumPct",
+                        color="Serie",
+                        markers=True,
+                        labels={"Label": "Período", "RetornoAcumPct": "Rentabilidade Acumulada (%)"},
+                        title=f"Rentabilidade Acumulada Mensal por Tipo (juros compostos) — {sufixo_retorno}",
+                    )
+                    fig_acum_tipo.update_layout(margin=dict(t=60))
+                    st.plotly_chart(fig_acum_tipo, use_container_width=True, key="rentab_chart_acum_tipo")
+
+                with st.expander("📋 Ver base mensal (ativo x mês)", expanded=False):
+                    cols_show = [
+                        "Usuário", "Tipo", "Chave", "MesAno",
+                        "QuantidadeAnterior", "QuantidadeAtual", "QuantidadeBase",
+                        "PrecoAnterior", "PrecoAtual", "ValorInicial", "ValorFinal",
+                        "Dividendos", "RetornoPct",
+                    ]
+                    cols_show = [c for c in cols_show if c in base_tbl.columns]
+                    st.dataframe(base_tbl[cols_show], use_container_width=True, hide_index=True)
 
                     with st.expander("📋 Ver tabela do gráfico", expanded=False):
                         tabela = df_plot[["Serie", "Label", "RetornoPct"]].copy()
                         tabela["RetornoPct"] = pd.to_numeric(tabela["RetornoPct"], errors="coerce")
                         st.dataframe(tabela, use_container_width=True, hide_index=True)
+
+# ============ TAB POSIÇÃO ATUAL ============
+with tab_posicao:
+    st.header("📌 Posição Atual")
+
+    # Para Posição Atual, queremos Ações Dólar em USD (para aplicar câmbio atual na atualização)
+    df_acoes_avenue_pos_usd = pd.DataFrame()
+    if not df_acoes_avenue_raw.empty:
+        try:
+            df_acoes_avenue_pos_usd = padronizar_acoes_avenue(df_acoes_avenue_raw)
+            df_acoes_avenue_pos_usd["Tipo"] = "Ações Dólar"
+            for col in ["Mês/Ano", "Usuário"]:
+                if col not in df_acoes_avenue_pos_usd.columns:
+                    df_acoes_avenue_pos_usd[col] = None
+        except Exception:
+            df_acoes_avenue_pos_usd = pd.DataFrame()
+
+    frames_consolidados = []
+    if not df_padronizado.empty:
+        frames_consolidados.append(df_padronizado.copy())
+    if not df_acoes_avenue_pos_usd.empty:
+        frames_consolidados.append(df_acoes_avenue_pos_usd.copy())
+
+    df_consolidado_geral = pd.concat(frames_consolidados, ignore_index=True) if frames_consolidados else pd.DataFrame()
+
+    # Mesmos filtros da aba 💼 Investimento (inclui opção "Todos")
+    df_base_filtrada = aplicar_filtros_padrao(df_consolidado_geral, "posicao_atual")
+    df_posicao_base = preparar_posicao_base(df_base_filtrada, agrupar_por_usuario=False)
+
+    if df_posicao_base.empty:
+        st.info("Sem dados de posição para atualizar.")
+    else:
+        col_a, col_b = st.columns([1, 2])
+        with col_a:
+            if st.button("Atualizar cotações", key="posicao_atual_btn_atualizar"):
+                st.session_state["posicao_atual_forcar_update"] = True
+
+        last_dt = st.session_state.get("posicao_atual_ultima_atualizacao")
+        with col_b:
+            if isinstance(last_dt, datetime):
+                st.caption(f"Última atualização: {last_dt.strftime('%d/%m/%Y %H:%M:%S')}")
+
+        # Se a base mudou (ex: novo upload), força atualização
+        try:
+            base_sig = f"{len(df_posicao_base)}|{','.join(df_posicao_base['Ticker'].astype(str).head(50).tolist())}"  # assinatura leve
+        except Exception:
+            base_sig = None
+
+        precisa_atualizar = (
+            st.session_state.get("posicao_atual_df") is None
+            or st.session_state.get("posicao_atual_forcar_update") is True
+            or (base_sig is not None and st.session_state.get("posicao_atual_base_sig") != base_sig)
+        )
+
+        if precisa_atualizar:
+            with st.spinner("Buscando cotações em tempo real (yfinance)..."):
+                df_atual, sem_cotacao, dt_atual = atualizar_cotacoes(df_posicao_base)
+            st.session_state["posicao_atual_df"] = df_atual
+            st.session_state["posicao_atual_sem_cotacao"] = sem_cotacao
+            st.session_state["posicao_atual_ultima_atualizacao"] = dt_atual
+            st.session_state["posicao_atual_base_sig"] = base_sig
+            st.session_state["posicao_atual_forcar_update"] = False
+
+        df_atual = st.session_state.get("posicao_atual_df")
+        sem_cotacao = st.session_state.get("posicao_atual_sem_cotacao") or []
+
+        if sem_cotacao:
+            st.warning(
+                "Sem cotação via yfinance (usando último preço do histórico quando disponível): "
+                + ", ".join(sem_cotacao)
+            )
+
+        # Câmbio atual (se houver Ações Dólar)
+        try:
+            fx = pd.to_numeric(df_atual.get("Cotação USD/BRL"), errors="coerce")
+            fx_val = float(fx.dropna().iloc[0]) if fx is not None and fx.dropna().size else None
+        except Exception:
+            fx_val = None
+        if fx_val is not None:
+            st.caption(f"USD/BRL (atual): {fx_val:,.4f}")
+
+        # Copiar modelo da aba 💼 Investimento: métricas + gráfico de distribuição
+        df_view = df_atual.copy()
+        df_view["Valor"] = df_view.get("Valor Atualizado")
+        if "Ativo" not in df_view.columns:
+            df_view["Ativo"] = df_view.get("Ticker")
+
+        df_view_enriquecido = enriquecer_com_setor_segmento(df_view)
+
+        # Cards (padrão mercado): Total + USD/BRL + EUR/BRL (com variação %)
+        st.markdown("---")
+        c1, c2, c3 = st.columns(3)
+        total_val = float(pd.to_numeric(df_view_enriquecido.get("Valor"), errors="coerce").fillna(0).sum())
+        with c1:
+            st.metric("💰 Valor Total (Atualizado)", f"R$ {total_val:,.2f}")
+
+        def _cotacao_e_delta(indice: str):
+            try:
+                h = obter_historico_indice(indice, periodo="10d", intervalo="1d")
+                if h is None or h.empty or "Close" not in h.columns:
+                    return None, None
+                close = pd.to_numeric(h["Close"], errors="coerce").dropna()
+                if close.size < 2:
+                    return float(close.iloc[-1]) if close.size else None, None
+                last = float(close.iloc[-1])
+                prev = float(close.iloc[-2])
+                if prev <= 0:
+                    return last, None
+                return last, (last / prev - 1.0) * 100.0
+            except Exception:
+                return None, None
+
+        usd, usd_delta = _cotacao_e_delta("USD/BRL")
+        eur, eur_delta = _cotacao_e_delta("EUR/BRL")
+        with c2:
+            if usd is None:
+                st.metric("USD/BRL", "—")
+            else:
+                st.metric("USD/BRL", f"R$ {usd:,.4f}", (f"{usd_delta:+.2f}%" if usd_delta is not None else None))
+        with c3:
+            if eur is None:
+                st.metric("EUR/BRL", "—")
+            else:
+                st.metric("EUR/BRL", f"R$ {eur:,.4f}", (f"{eur_delta:+.2f}%" if eur_delta is not None else None))
+
+        # Mantém o detalhamento por tipo (mesmo padrão de Investimento)
+        # exibir_metricas_valor(df_view_enriquecido, col_valor="Valor")  # Removido para evitar duplicidade visual
+
+        # Painéis: Top 5 Altas / Top 5 Baixas
+        st.markdown("---")
+        col_up, col_down = st.columns(2)
+        base_mov = df_view_enriquecido.copy()
+        base_mov["Variação %"] = pd.to_numeric(base_mov.get("Variação %"), errors="coerce")
+        base_mov = base_mov.dropna(subset=["Variação %"]).copy()
+        cols_mov = [c for c in ["Ticker", "Tipo", "Variação %", "Preço Histórico (BRL)", "Preço Atual", "Valor Atualizado"] if c in base_mov.columns]
+
+        with col_up:
+            st.subheader("📈 Maiores Altas (Top 5)")
+            if base_mov.empty:
+                st.info("Sem dados suficientes para calcular variação.")
+            else:
+                df_top_up = base_mov.nlargest(5, "Variação %")[cols_mov].copy()
+                _, sty_up = preparar_tabela_posicao_estilizada(df_top_up)
+                st.dataframe(sty_up, use_container_width=True, hide_index=True)
+
+        with col_down:
+            st.subheader("📉 Maiores Baixas (Top 5)")
+            if base_mov.empty:
+                st.info("Sem dados suficientes para calcular variação.")
+            else:
+                df_top_down = base_mov.nsmallest(5, "Variação %")[cols_mov].copy()
+                _, sty_down = preparar_tabela_posicao_estilizada(df_top_down)
+                st.dataframe(sty_down, use_container_width=True, hide_index=True)
+
+        with st.expander("📋 Ver tabela completa (posição atualizada)", expanded=False):
+            df_tab, sty = preparar_tabela_posicao_estilizada(df_view_enriquecido)
+            st.dataframe(sty, use_container_width=True, hide_index=True)
+
+        gerar_graficos_distribuicao(df_view_enriquecido, col_valor="Valor", cores="Purples", key_prefixo="posicao_atual")
+        exibir_tabela_info_tickers(df_view_enriquecido)
+
+        # Exportação
+        st.markdown("---")
+        csv_bytes = df_view_enriquecido.to_csv(index=False, sep=",", encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button(
+            "Exportar CSV",
+            data=csv_bytes,
+            file_name="posicao_atual.csv",
+            mime="text/csv",
+            key="posicao_atual_download_csv",
+        )
+
+        try:
+            xlsx_bytes = dataframe_para_excel_bytes(df_view_enriquecido, sheet_name="posicao_atual")
+            st.download_button(
+                "Exportar Excel",
+                data=xlsx_bytes,
+                file_name="posicao_atual.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="posicao_atual_download_xlsx",
+            )
+        except Exception:
+            st.info("Não foi possível gerar o Excel. Verifique se o pacote 'openpyxl' está instalado.")
 
 # ============ TAB OUTROS ============
 with tab_outros:
@@ -1400,12 +1823,251 @@ with tab_outros:
             else:
                 st.error("Preencha todos os campos.")
         st.table(df_usuarios)
-    
+
     # --- Inserção Manual ---
     with subtab_insercao:
-        st.header("📝 Inserção Manual de Investimentos")
-        st.info("Funcionalidade em desenvolvimento.")
+        st.header("📝 Inserção Manual")
+        
+        # Abas secundárias para Caixa e Ações
+        sec_caixa, sec_acoes, sec_view = st.tabs([
+            "💵 Caixa",
+            "📈 Ações",
+            "📊 Investimentos Manuais"
+        ])
+        
+        # --- Caixa ---
+        with sec_caixa:
+            st.subheader("💵 Registrar Caixa")
+            col_c1, col_c2 = st.columns(2)
+            with col_c1:
+                mes_caixa = st.text_input(
+                    "Mês (MM/YYYY)",
+                    value=pd.Timestamp.now().strftime("%m/%Y"),
+                    key="caixa_mes"
+                )
+            with col_c2:
+                usr_caixa = st.selectbox(
+                    "Usuário",
+                    options=sorted(df_usuarios.get("Nome", pd.Series()).dropna().unique().tolist()) + ["Manual"],
+                    index=None,
+                    key="caixa_usr"
+                )
+            
+            col_c3, col_c4 = st.columns(2)
+            with col_c3:
+                val_caixa = st.number_input(
+                    "Valor Inicial (R$)",
+                    min_value=0.0,
+                    step=100.0,
+                    key="caixa_val"
+                )
+            with col_c4:
+                rent_caixa = st.number_input(
+                    "Rentabilidade (%)",
+                    min_value=0.0,
+                    step=0.1,
+                    key="caixa_rent"
+                )
+            
+            if st.button("Registrar Caixa", key="btn_reg_caixa"):
+                try:
+                    df_caixa_new = registrar_caixa(
+                        mes_caixa,
+                        val_caixa,
+                        rent_caixa,
+                        usuario=usr_caixa or "Manual"
+                    )
+                    st.success(f"✅ Caixa registrado para {mes_caixa}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Erro: {e}")
+            
+            st.markdown("---")
+            st.subheader("Registros de Caixa")
+            df_caixa_view = carregar_caixa()
+            if not df_caixa_view.empty:
+                st.dataframe(df_caixa_view, use_container_width=True, hide_index=True)
+                csv_caixa = df_caixa_view.to_csv(index=False)
+                st.download_button(
+                    "📥 CSV Caixa",
+                    csv_caixa,
+                    "caixa.csv",
+                    "text/csv",
+                    key="dl_csv_caixa"
+                )
+            else:
+                st.info("Sem registros de caixa.")
+        
+        # --- Ações ---
+        with sec_acoes:
+            st.subheader("📈 Inserir Ação Manual")
+            col_a1, col_a2 = st.columns(2)
+            with col_a1:
+                ticker_acao = st.text_input(
+                    "Ticker (ex: BBAS3, AAPL)",
+                    key="acao_ticker"
+                )
+            with col_a2:
+                mes_acao = st.text_input(
+                    "Mês (MM/YYYY)",
+                    value=pd.Timestamp.now().strftime("%m/%Y"),
+                    key="acao_mes"
+                )
+            
+            col_a3, col_a4 = st.columns(2)
+            with col_a3:
+                qtd_acao = st.number_input(
+                    "Quantidade",
+                    min_value=0.0,
+                    step=1.0,
+                    key="acao_qtd"
+                )
+            with col_a4:
+                usr_acao = st.selectbox(
+                    "Usuário",
+                    options=sorted(df_usuarios.get("Nome", pd.Series()).dropna().unique().tolist()) + ["Manual"],
+                    index=None,
+                    key="acao_usr"
+                )
+            
+            if st.button("Buscar Preço e Registrar", key="btn_reg_acao"):
+                if not ticker_acao or qtd_acao <= 0:
+                    st.error("❌ Preencha ticker e quantidade.")
+                else:
+                    with st.spinner("Buscando preço no yfinance..."):
+                        try:
+                            df_acoes_new, meta = registrar_acao_manual(
+                                ticker_acao,
+                                qtd_acao,
+                                mes_acao,
+                                usuario=usr_acao or "Manual"
+                            )
+                            st.success(f"✅ Ação {ticker_acao} registrada!")
+                            st.markdown(f"""
+**Resumo:**
+- **Tipo:** {meta['tipo']}
+- **Preço Atual:** {meta['moeda']} {meta['preco']:.4f}
+- **Cotação:** 1 {meta['moeda']} = R$ {meta['fx']:.4f}
+- **Preço BRL:** R$ {meta['preco_brl']:.2f}
+- **Valor Total:** R$ {meta['valor_total_brl']:,.2f}
+                            """)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Erro: {e}")
+            
+            st.markdown("---")
+            st.subheader("Ações Inseridas")
+            df_acoes_view = carregar_acoes_man()
+            if not df_acoes_view.empty:
+                st.dataframe(df_acoes_view, use_container_width=True, hide_index=True)
+                csv_acoes = df_acoes_view.to_csv(index=False)
+                st.download_button(
+                    "📥 CSV Ações",
+                    csv_acoes,
+                    "acoes_manuais.csv",
+                    "text/csv",
+                    key="dl_csv_acoes"
+                )
+            else:
+                st.info("Sem ações inseridas manualmente.")
+        
+        # --- Visualizar ---
+        with sec_view:
+            st.subheader("📊 Investimentos Manuais")
+            
+            tabs_man = st.tabs(["Consolidado", "Caixa", "Ações"])
+            
+            with tabs_man[0]:
+                st.markdown("**Consolidado (Caixa + Ações)**")
+                df_caixa_all = carregar_caixa()
+                df_acoes_all = carregar_acoes_man()
+                
+                consolidado_parts = []
+                if not df_caixa_all.empty:
+                    df_caixa_view_cons = df_caixa_all[[
+                        "Usuário", "Mes", "Valor Inicial", "Rentabilidade %", "Ganho"
+                    ]].copy()
+                    df_caixa_view_cons["Tipo"] = "Caixa"
+                    consolidado_parts.append(df_caixa_view_cons)
+                
+                if not df_acoes_all.empty:
+                    df_acoes_view_cons = df_acoes_all[[
+                        "Usuário", "Tipo", "Ticker", "Quantidade", "Preço BRL", "Valor", "Mês/Ano"
+                    ]].rename(columns={"Mês/Ano": "Mes"}).copy()
+                    consolidado_parts.append(df_acoes_view_cons)
+                
+                if consolidado_parts:
+                    df_consolidado_man = pd.concat(consolidado_parts, ignore_index=True)
+                    st.dataframe(df_consolidado_man, use_container_width=True, hide_index=True)
+                    
+                    # Exportar consolidado
+                    csv_cons = df_consolidado_man.to_csv(index=False)
+                    st.download_button(
+                        "📥 CSV Consolidado",
+                        csv_cons,
+                        "investimentos_manuais.csv",
+                        "text/csv",
+                        key="dl_csv_cons"
+                    )
+                    
+                    try:
+                        xlsx_cons = df_manual_para_excel(df_consolidado_man, sheet_name="investimentos_manuais")
+                        st.download_button(
+                            "📥 Excel",
+                            xlsx_cons,
+                            "investimentos_manuais.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="dl_xlsx_cons"
+                        )
+                    except Exception:
+                        st.info("Excel não disponível.")
+                else:
+                    st.info("Sem dados manuais.")
+            
+            with tabs_man[1]:
+                st.markdown("**Caixa**")
+                df_caixa_view_det = carregar_caixa()
+                if not df_caixa_view_det.empty:
+                    st.dataframe(df_caixa_view_det, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Sem registros de caixa.")
+            
+            with tabs_man[2]:
+                st.markdown("**Ações**")
+                df_acoes_view_det = carregar_acoes_man()
+                if not df_acoes_view_det.empty:
+                    st.dataframe(df_acoes_view_det, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Sem ações inseridas manualmente.")
     
     # --- Documentação ---
     with subtab_doc:
-        st.info("A documentação completa do sistema está disponível na página 'Documentação' do menu lateral.")
+        st.header("📚 Documentação")
+        st.markdown("""
+## Inserção Manual
+
+### 💵 Caixa
+- Registre o valor inicial do caixa no mês e a rentabilidade (%).
+- O sistema calcula o ganho (Valor Inicial × Rentabilidade / 100).
+- O ganho é automaticamente integrado à aba **Rentabilidade** como "Dividendos".
+
+### 📈 Ações
+- Insira o ticker (ex: BBAS3, AAPL) e a quantidade.
+- O sistema busca automaticamente:
+  - Preço atual via **yfinance**
+  - Moeda da ação (USD, EUR, BRL)
+  - Cotação para BRL (se necessário)
+- Categorização automática:
+  - "Ações Dólar" (USD)
+  - "Ações Euro" (EUR)
+  - "Ações BRL" (BRL)
+
+### 📊 Exportação
+- CSV: compatível com Excel e ferramentas de análise.
+- Excel: formato .xlsx com formatação.
+
+---
+
+**Nota:** Todos os dados são salvos automaticamente em parquets (formato otimizado para análise de séries temporais).
+        """)
+

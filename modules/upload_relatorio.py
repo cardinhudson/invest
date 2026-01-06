@@ -426,7 +426,7 @@ def carregar_historico_parquet():
 def padronizar_renda_fixa(df_rf: pd.DataFrame) -> pd.DataFrame:
     """
     Padroniza DataFrame de Renda Fixa para colunas:
-    Produto, Código, Quantidade Disponível, Preço, Valor
+    Produto, Código, Quantidade, Quantidade Disponível, Preço, Valor
     """
     df = df_rf.copy()
     
@@ -441,6 +441,10 @@ def padronizar_renda_fixa(df_rf: pd.DataFrame) -> pd.DataFrame:
     resultado = pd.DataFrame()
     resultado["Produto"] = df.get("Produto")
     resultado["Código"] = df.get("Código")
+    # RF normalmente vem apenas com "Quantidade Disponível"; manter ambas por compatibilidade
+    resultado["Quantidade"] = df.get("Quantidade")
+    if resultado["Quantidade"].isna().all():
+        resultado["Quantidade"] = df.get("Quantidade Disponível")
     resultado["Quantidade Disponível"] = df.get("Quantidade Disponível")
     resultado["Preço"] = df.get(preco_col) if preco_col else None
     resultado["Valor"] = df.get("Valor")
@@ -448,7 +452,7 @@ def padronizar_renda_fixa(df_rf: pd.DataFrame) -> pd.DataFrame:
     resultado["Mês/Ano"] = df.get("Mês/Ano")
     
     # Converte para numérico (tolerante a separadores)
-    for col in ["Quantidade Disponível", "Preço", "Valor"]:
+    for col in ["Quantidade", "Quantidade Disponível", "Preço", "Valor"]:
         resultado[col] = resultado[col].apply(_parse_num_misto)
         resultado[col] = pd.to_numeric(resultado[col], errors="coerce")
     
@@ -458,7 +462,7 @@ def padronizar_renda_fixa(df_rf: pd.DataFrame) -> pd.DataFrame:
 def padronizar_acoes(df_acoes: pd.DataFrame) -> pd.DataFrame:
     """
     Padroniza DataFrame de Ações para colunas:
-    Produto, Código, Quantidade Disponível, Preço, Valor
+    Produto, Código, Quantidade, Quantidade Disponível, Preço, Valor
     """
     df = df_acoes.copy()
     
@@ -466,6 +470,10 @@ def padronizar_acoes(df_acoes: pd.DataFrame) -> pd.DataFrame:
     resultado = pd.DataFrame()
     resultado["Produto"] = df.get("Produto")
     resultado["Código"] = df.get("Código de Negociação")
+    # Para patrimônio, a fonte correta é "Quantidade" (não a disponível)
+    resultado["Quantidade"] = df.get("Quantidade")
+    if resultado["Quantidade"].isna().all():
+        resultado["Quantidade"] = df.get("Quantidade Disponível")
     resultado["Quantidade Disponível"] = df.get("Quantidade Disponível")
     resultado["Preço"] = df.get("Preço de Fechamento")
     resultado["Valor"] = df.get("Valor")
@@ -473,7 +481,7 @@ def padronizar_acoes(df_acoes: pd.DataFrame) -> pd.DataFrame:
     resultado["Mês/Ano"] = df.get("Mês/Ano")
     
     # Converte para numérico (tolerante a separadores)
-    for col in ["Quantidade Disponível", "Preço", "Valor"]:
+    for col in ["Quantidade", "Quantidade Disponível", "Preço", "Valor"]:
         resultado[col] = resultado[col].apply(_parse_num_misto)
         resultado[col] = pd.to_numeric(resultado[col], errors="coerce")
     
@@ -500,7 +508,7 @@ def _is_opcao(produto: str, codigo: str) -> bool:
 def padronizar_tabelas(df_acoes: pd.DataFrame, df_renda_fixa: pd.DataFrame) -> pd.DataFrame:
     """
     Consolida Ações e Renda Fixa em um único DataFrame com colunas padronizadas.
-    Retorna um DataFrame com colunas: Ativo, Ticker, Quantidade Disponível, Preço, Valor, Tipo
+    Retorna um DataFrame com colunas: Ativo, Ticker, Quantidade, Quantidade Disponível, Preço, Valor, Tipo
     """
     df_acoes_pad = padronizar_acoes(df_acoes) if not df_acoes.empty else pd.DataFrame()
     df_rf_pad = padronizar_renda_fixa(df_renda_fixa) if not df_renda_fixa.empty else pd.DataFrame()
@@ -532,7 +540,19 @@ def padronizar_tabelas(df_acoes: pd.DataFrame, df_renda_fixa: pd.DataFrame) -> p
     consolidado = consolidado.dropna(subset=["Ativo", "Valor"])
     consolidado = consolidado[consolidado["Valor"] > 0]
 
-    return consolidado[["Ativo", "Ticker", "Quantidade Disponível", "Preço", "Valor", "Tipo", "Usuário", "Mês/Ano"]]
+    cols_out = [
+        "Ativo",
+        "Ticker",
+        "Quantidade",
+        "Quantidade Disponível",
+        "Preço",
+        "Valor",
+        "Tipo",
+        "Usuário",
+        "Mês/Ano",
+    ]
+    cols_out = [c for c in cols_out if c in consolidado.columns]
+    return consolidado[cols_out]
 
 def padronizar_dividendos(df_proventos: pd.DataFrame) -> pd.DataFrame:
     """
