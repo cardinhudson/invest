@@ -41,7 +41,16 @@ from modules.opcoes_net import (
     salvar_cache_opcoesnet,
     exportar_opcoesnet_para_excel,
     LayoutOpcoesNetMudouError,
+    listar_vencimentos_opcoesnet,
 )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _listar_vencimentos_opcoesnet_cached(id_acao: str) -> list[dict]:
+    id_acao = (id_acao or "").strip().upper()
+    if not id_acao:
+        return []
+    return listar_vencimentos_opcoesnet(id_acao)
 
 # Alguns símbolos foram adicionados recentemente ao módulo; em ambiente Streamlit
 # pode existir cache de import durante hot-reload. Fazemos fallback com reload.
@@ -143,14 +152,63 @@ def aplicar_filtros_padrao(df, chave_prefixo="filtro"):
     
     return df_filtrado
 
-def exibir_metricas_valor(df, col_valor="Valor", salvar_no_session_state_key=None):
-    """Exibe métricas de valor total e por tipo"""
+def exibir_metricas_valor(df, col_valor="Valor", salvar_no_session_state_key=None, df_mes_anterior=None, label_comparacao=None):
+    """Exibe métricas de valor total e por tipo com comparação vs mês anterior
+    
+    Args:
+        df: DataFrame atual
+        col_valor: Nome da coluna de valor
+        salvar_no_session_state_key: Key para salvar valor total no session_state
+        df_mes_anterior: DataFrame do mês anterior para comparação
+        label_comparacao: Label do mês de comparação (ex: "12/2025")
+    """
     if df.empty or col_valor not in df.columns:
         return
     
+    import unicodedata
+
+    def _to_num_series(s: pd.Series) -> pd.Series:
+        if s is None:
+            return pd.Series(dtype="float")
+        if not isinstance(s, pd.Series):
+            s = pd.Series(s)
+        if pd.api.types.is_numeric_dtype(s):
+            return pd.to_numeric(s, errors="coerce")
+        txt = s.astype(str)
+        txt = (
+            txt.str.replace("R$", "", regex=False)
+            .str.replace("US$", "", regex=False)
+            .str.replace("$", "", regex=False)
+            .str.replace("%", "", regex=False)
+            .str.replace("\u00a0", " ", regex=False)
+            .str.replace(" ", "", regex=False)
+        )
+        # normaliza pt-BR/US: remove milhar e usa '.' como decimal
+        txt = txt.str.replace(r"\.(?=\d{3}(\D|$))", "", regex=True)
+        txt = txt.str.replace(",", ".", regex=False)
+        return pd.to_numeric(txt, errors="coerce")
+
+    def _norm_tipo(v) -> str:
+        s = "" if pd.isna(v) else str(v)
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))
+        s = " ".join(s.strip().split())
+        return s.lower()
+
     # Valor total
-    valor_total = df[col_valor].sum()
-    st.metric("💰 Valor Total", f"R$ {valor_total:,.2f}")
+    valor_total = _to_num_series(df[col_valor]).fillna(0).sum()
+    
+    # Calcular variação % vs mês anterior
+    delta_total = None
+    if df_mes_anterior is not None and not df_mes_anterior.empty and col_valor in df_mes_anterior.columns:
+        valor_anterior = _to_num_series(df_mes_anterior[col_valor]).fillna(0).sum()
+        if valor_anterior > 0:
+            delta_total = ((valor_total - valor_anterior) / valor_anterior) * 100.0
+    
+    if delta_total is not None and label_comparacao:
+        st.metric("💰 Valor Total", f"R$ {valor_total:,.2f}", f"{delta_total:+.2f}% vs {label_comparacao}")
+    else:
+        st.metric("💰 Valor Total", f"R$ {valor_total:,.2f}")
     
     # Salvar no session_state se solicitado
     if salvar_no_session_state_key:
@@ -158,15 +216,42 @@ def exibir_metricas_valor(df, col_valor="Valor", salvar_no_session_state_key=Non
     
     # Por tipo se disponível
     if "Tipo" in df.columns:
-        tipos = df["Tipo"].unique()
+        df_tmp = df.copy()
+        df_tmp["_tipo_norm"] = df_tmp["Tipo"].apply(_norm_tipo)
+        df_prev = None
+        if df_mes_anterior is not None and not df_mes_anterior.empty and "Tipo" in df_mes_anterior.columns:
+            df_prev = df_mes_anterior.copy()
+            df_prev["_tipo_norm"] = df_prev["Tipo"].apply(_norm_tipo)
+
+        tipos = df_tmp["Tipo"].dropna().unique()
         if len(tipos) > 1:
             st.markdown("---")
             st.subheader("Por Tipo")
             cols = st.columns(min(len(tipos), 4))
             for idx, tipo in enumerate(sorted(tipos)):
                 with cols[idx % 4]:
-                    valor_tipo = df[df["Tipo"] == tipo][col_valor].sum()
-                    st.metric(tipo, f"R$ {valor_tipo:,.2f}")
+                    tipo_norm = _norm_tipo(tipo)
+                    valor_tipo = pd.to_numeric(
+                        df_tmp[df_tmp["_tipo_norm"] == tipo_norm][col_valor],
+                        errors="coerce",
+                    )
+                    valor_tipo = _to_num_series(valor_tipo).fillna(0).sum()
+                    
+                    # Calcular variação % vs mês anterior para este tipo
+                    delta_tipo = None
+                    if df_prev is not None and col_valor in df_prev.columns:
+                        valor_tipo_anterior = pd.to_numeric(
+                            df_prev[df_prev["_tipo_norm"] == tipo_norm][col_valor],
+                            errors="coerce",
+                        )
+                        valor_tipo_anterior = _to_num_series(valor_tipo_anterior).fillna(0).sum()
+                        if valor_tipo_anterior > 0:
+                            delta_tipo = ((valor_tipo - valor_tipo_anterior) / valor_tipo_anterior) * 100.0
+                    
+                    if delta_tipo is not None and label_comparacao:
+                        st.metric(tipo, f"R$ {valor_tipo:,.2f}", f"{delta_tipo:+.2f}% vs {label_comparacao}")
+                    else:
+                        st.metric(tipo, f"R$ {valor_tipo:,.2f}")
 
 def gerar_graficos_distribuicao(df, col_valor="Valor", cores="Blues", key_prefixo="dist"):
     """Gera gráficos de pizza e barras para distribuição"""
@@ -252,11 +337,11 @@ def gerar_graficos_distribuicao(df, col_valor="Valor", cores="Blues", key_prefix
             max_val = top_ativos.values.max() if len(top_ativos.values) else 0
             tickers_x = [extrair_ticker(a) or str(a) for a in top_ativos.index] if eixo_categoria == "Ativo" else list(top_ativos.index)
             from plotly.colors import sample_colorscale
-            blues = px.colors.sequential.Blues[::-1]  # maior = azul escuro
+            purples = px.colors.sequential.Purples[::-1]  # maior = roxo escuro
             n = len(top_ativos)
             valores = np.array(top_ativos.values)
             norm = (valores - valores.min()) / (valores.max() - valores.min()) if valores.max() > valores.min() else np.full(n, 0.5)
-            bar_colors = sample_colorscale(blues[::-1], norm)
+            bar_colors = sample_colorscale(purples[::-1], norm)
             fig_bar = px.bar(
                 x=tickers_x,
                 y=top_ativos.values,
@@ -429,11 +514,11 @@ def gerar_grafico_top_pagadores(df: pd.DataFrame, coluna_ativo: str = "Ativo", c
         max_val = top_ativos.values.max() if len(top_ativos.values) else 0
         tickers_x = list(top_ativos.index)
         from plotly.colors import sample_colorscale
-        blues = px.colors.sequential.Blues[::-1]
+        purples = px.colors.sequential.Purples[::-1]
         n = len(top_ativos)
         valores = np.array(top_ativos.values)
         norm = (valores - valores.min()) / (valores.max() - valores.min()) if valores.max() > valores.min() else np.full(n, 0.5)
-        bar_colors = sample_colorscale(blues, norm)
+        bar_colors = sample_colorscale(purples, norm)
         fig_top = px.bar(
             x=tickers_x,
             y=top_ativos.values,
@@ -583,6 +668,26 @@ def ticker_para_yf(ticker):
     return t
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def _obter_preco_atual_acao_yf_cached(ticker_base: str) -> float | None:
+    """Obtém o último Close disponível via yfinance para o ativo base."""
+    try:
+        import yfinance as yf
+
+        tk = ticker_para_yf((ticker_base or "").strip().upper())
+        if not tk:
+            return None
+        hist = yf.Ticker(tk).history(period="5d")
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            return None
+        close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+        if close.empty:
+            return None
+        return float(close.iloc[-1])
+    except Exception:
+        return None
+
+
 @st.cache_data(show_spinner=False)
 def exibir_tabela_info_tickers(df, titulo="📄 Ticker / Setor / Fundamentais (yfinance)"):
     """Exibe tabela com tickers padronizados e informações de setor/fundamentos via yfinance."""
@@ -700,7 +805,7 @@ with tab_acoes:
     
     # --- Ações Dólar ---
     with subtab_dolar:
-        aba_acoes_avenue()
+        aba_acoes_avenue(exibir_metricas_valor_fn=exibir_metricas_valor)
     
     # --- Ações Consolidadas ---
     with subtab_consolidadas:
@@ -944,19 +1049,9 @@ with tab_opcoes:
     with subtab_consulta:
         st.subheader("Consultar Opções Disponíveis")
 
-        fonte_dados = st.selectbox(
-            "Fonte de dados",
-            ["yfinance (cadeia por ativo)", "opcoes.net.br (B3 - tabela geral)"],
-            index=0,
-            help="Use yfinance para cadeia por ativo. Use opcoes.net.br para uma tabela geral do mercado B3.",
-        )
+        st.info("Fonte de dados: opcoes.net.br (B3). Selecione ativo e vencimento antes de atualizar para reduzir memória/tempo.")
 
-        # Cache local da última consulta (evita refazer chamadas a cada rerun)
-        df_opcoes_cache = st.session_state.get("opcoes_df_cache")
-        if not isinstance(df_opcoes_cache, pd.DataFrame):
-            df_opcoes_cache = pd.DataFrame()
-
-        # Cache para opcoes.net.br
+        # Cache para opcoes.net.br (mantém apenas o último resultado carregado)
         df_opcoesnet_cache = st.session_state.get("opcoesnet_df_cache")
         if not isinstance(df_opcoesnet_cache, pd.DataFrame):
             df_opcoesnet_cache = pd.DataFrame()
@@ -976,330 +1071,303 @@ with tab_opcoes:
         if not df_manual_acoes.empty and "Ticker" in df_manual_acoes.columns:
             acoes_disponiveis.extend(df_manual_acoes["Ticker"].unique().tolist())
         
-        acoes_disponiveis = sorted(list(set(acoes_disponiveis)))
+        # Normalizar: extrair apenas ticker (parte antes do '-' ou espaço, remover .SA)
+        def _normalizar_ticker_b3(ticker: str) -> str:
+            if not ticker:
+                return ""
+            t = str(ticker).strip().upper()
+            # Remover quebras de linha e espaços duplos
+            t = " ".join(t.split())
+            # Se tem ' - ', pega apenas a parte antes
+            if " - " in t:
+                t = t.split(" - ", 1)[0].strip()
+            # Remove .SA se existir
+            if t.endswith(".SA"):
+                t = t[:-3]
+            return t
         
-        if not acoes_disponiveis and fonte_dados.startswith("yfinance"):
-            st.info("Nenhuma ação encontrada na carteira. Adicione ações primeiro.")
-        else:
-            if fonte_dados.startswith("yfinance"):
-                col1, col2 = st.columns(2)
+        acoes_disponiveis = sorted(list(set([_normalizar_ticker_b3(a) for a in acoes_disponiveis if _normalizar_ticker_b3(a)])))
 
-                with col1:
-                    ticker_selecionado = st.selectbox("Selecione a Ação", acoes_disponiveis)
+        # opcoes.net.br: carrega cache do disco se ainda não existe em memória
+        if df_opcoesnet_cache.empty:
+            try:
+                df_disk = carregar_cache_opcoesnet()
+            except Exception:
+                df_disk = pd.DataFrame()
+            if isinstance(df_disk, pd.DataFrame) and not df_disk.empty:
+                df_opcoesnet_cache = df_disk
+                st.session_state["opcoesnet_df_cache"] = df_opcoesnet_cache
 
-                with col2:
-                    tipo_opcao = st.radio("Tipo de Opção", ["Call", "Put"], horizontal=True)
-            else:
-                st.info(
-                    "Esta consulta busca as opções no opcoes.net.br para um ativo base (B3) e permite filtrar por tipo/vencimento e exportar."
-                )
-            
-            # Filtros
-            st.markdown("### Filtros")
-            col_f1, col_f2 = st.columns(2)
-            
-            with col_f1:
-                usar_filtro_distancia = st.checkbox("Filtrar por distância do strike (%)")
-                if usar_filtro_distancia:
-                    distancia_min = st.number_input("Distância mínima (%)", value=0.0, step=0.5)
-                    distancia_max = st.number_input("Distância máxima (%)", value=10.0, step=0.5)
-                else:
-                    distancia_min = None
-                    distancia_max = None
+        st.markdown("### Seleção (antes de atualizar)")
 
-            with col_f2:
-                st.caption("Filtre por mês de vencimento para reduzir resultados")
-                meses_disponiveis = []
-                if fonte_dados.startswith("yfinance"):
-                    if not df_opcoes_cache.empty and "Mês Vencimento" in df_opcoes_cache.columns:
-                        meses_disponiveis = [m for m in sorted(df_opcoes_cache["Mês Vencimento"].dropna().unique().tolist()) if m]
-                else:
-                    if not df_opcoesnet_cache.empty and "VENCIMENTO" in df_opcoesnet_cache.columns:
-                        meses_disponiveis = [
-                            m
-                            for m in sorted(
-                                pd.to_datetime(df_opcoesnet_cache["VENCIMENTO"], errors="coerce")
-                                .dt.strftime("%m/%Y")
-                                .dropna()
-                                .unique()
-                                .tolist()
-                            )
-                            if m
-                        ]
-                meses_sel = st.multiselect(
-                    "Mês de vencimento (MM/AAAA)",
-                    options=meses_disponiveis,
-                    default=meses_disponiveis,
-                    help="Mostra apenas opções cujo vencimento está no(s) mês(es) selecionado(s).",
-                )
-
-            if fonte_dados.startswith("yfinance"):
-                # Botão para consultar
-                if st.button("🔍 Buscar Opções", type="primary"):
-                    with st.spinner(f"Consultando opções disponíveis para {ticker_selecionado}..."):
-                        df_opcoes = consultar_opcoes_disponiveis(ticker_selecionado, tipo=tipo_opcao.lower())
-
-                        # salvar para permitir filtrar sem nova consulta
-                        st.session_state["opcoes_df_cache"] = df_opcoes
-                        df_opcoes_cache = df_opcoes
-
-                        if df_opcoes.empty:
-                            st.warning(
-                                f"Nenhuma opção encontrada para {ticker_selecionado}. "
-                                "Dica: para ações BR, o app normaliza automaticamente para .SA quando possível, "
-                                "mas o yfinance pode não ter cadeia de opções para alguns ativos."
-                            )
-                        else:
-                            st.caption(
-                                f"Ticker (yfinance): {df_opcoes.get('Ticker YF', pd.Series()).dropna().iloc[0] if 'Ticker YF' in df_opcoes.columns and df_opcoes.get('Ticker YF', pd.Series()).dropna().size else 'N/A'}"
-                            )
-            else:
-                # opcoes.net.br: carrega cache do disco se ainda não existe em memória
-                if df_opcoesnet_cache.empty:
-                    df_disk = carregar_cache_opcoesnet()
-                    if isinstance(df_disk, pd.DataFrame) and not df_disk.empty:
-                        df_opcoesnet_cache = df_disk
-                        st.session_state["opcoesnet_df_cache"] = df_opcoesnet_cache
-
-                col_sel1, col_sel2 = st.columns([2, 1])
-                with col_sel1:
-                    if acoes_disponiveis:
-                        ativo_base = st.selectbox(
-                            "Ativo base (B3)",
-                            options=acoes_disponiveis,
-                            index=0,
-                            help="Obrigatório para buscar opções no opcoes.net.br (ex: PETR4).",
-                        )
-                    else:
-                        ativo_base = st.text_input(
-                            "Ativo base (B3)",
-                            value="",
-                            help="Obrigatório para buscar opções no opcoes.net.br (ex: PETR4).",
-                        )
-                    ativo_base = (ativo_base or "").strip().upper()
-
-                with col_sel2:
-                    buscar_todos_vencimentos = st.checkbox(
-                        "Todos vencimentos",
-                        value=False,
-                        help="Se marcado, busca todos os vencimentos (pode demorar).",
-                    )
-
-                col_a1, col_a2 = st.columns([1, 1])
-                with col_a1:
-                    atualizar_auto = st.checkbox(
-                        "Atualizar automaticamente ao abrir",
-                        value=False,
-                        help="Se marcado, tenta buscar a tabela no site ao renderizar esta aba.",
-                    )
-                with col_a2:
-                    st.caption("Atualize manualmente se o cache estiver antigo")
-
-                def _precisa_atualizar(df: pd.DataFrame) -> bool:
-                    try:
-                        if df is None or df.empty or "Coletado Em" not in df.columns:
-                            return True
-                        last = pd.to_datetime(df["Coletado Em"], errors="coerce").max()
-                        if pd.isna(last):
-                            return True
-                        # 12h
-                        return (pd.Timestamp.now() - last) > pd.Timedelta(hours=12)
-                    except Exception:
-                        return True
-
-                def _mesclar_cache(df_old: pd.DataFrame, df_new: pd.DataFrame, ativo: str) -> pd.DataFrame:
-                    try:
-                        if df_old is None or df_old.empty:
-                            return df_new
-                        if "ATIVO" in df_old.columns:
-                            df_keep = df_old[~df_old["ATIVO"].astype(str).str.upper().eq(str(ativo).upper())]
-                            return pd.concat([df_keep, df_new], ignore_index=True)
-                        return df_new
-                    except Exception:
-                        return df_new
-
-                if atualizar_auto and _precisa_atualizar(df_opcoesnet_cache):
-                    st.info("Atualizando automaticamente (opcoes.net.br)...")
-                    try:
-                        if not ativo_base:
-                            st.warning("Informe o Ativo base (ex: PETR4) para atualizar automaticamente.")
-                            raise RuntimeError("Ativo base não informado")
-                        with st.spinner("Baixando tabela do opcoes.net.br..."):
-                            df_new = buscar_opcoes_opcoesnet_bovespa(
-                                id_acao=ativo_base,
-                                todos_vencimentos=buscar_todos_vencimentos,
-                            )
-                        df_merged = _mesclar_cache(df_opcoesnet_cache, df_new, ativo_base)
-                        salvar_cache_opcoesnet(df_merged)
-                        st.session_state["opcoesnet_df_cache"] = df_merged
-                        df_opcoesnet_cache = df_merged
-                        st.success("✅ Opções atualizadas")
-                    except LayoutOpcoesNetMudouError as e:
-                        st.error(f"⚠️ Layout do site mudou ou não foi possível ler a tabela: {e}")
-                    except Exception as e:
-                        st.error(f"❌ Erro ao buscar tabela do opcoes.net.br: {e}")
-
-                if st.button("🔄 Atualizar opções (opcoes.net.br)", type="primary"):
-                    try:
-                        if not ativo_base:
-                            st.warning("Informe o Ativo base (ex: PETR4) para atualizar.")
-                            st.stop()
-                        with st.spinner("Baixando tabela do opcoes.net.br..."):
-                            df_new = buscar_opcoes_opcoesnet_bovespa(
-                                id_acao=ativo_base,
-                                todos_vencimentos=buscar_todos_vencimentos,
-                            )
-                        df_merged = _mesclar_cache(df_opcoesnet_cache, df_new, ativo_base)
-                        salvar_cache_opcoesnet(df_merged)
-                        st.session_state["opcoesnet_df_cache"] = df_merged
-                        df_opcoesnet_cache = df_merged
-                        st.success("✅ Opções atualizadas")
-                    except LayoutOpcoesNetMudouError as e:
-                        st.error(f"⚠️ Layout do site mudou ou não foi possível ler a tabela: {e}")
-                    except Exception as e:
-                        st.error(f"❌ Erro ao buscar tabela do opcoes.net.br: {e}")
-
-        # Renderizar tabela/filters a partir do cache (após consulta)
-        if fonte_dados.startswith("yfinance") and not df_opcoes_cache.empty:
-            # Filtros adicionais (vencimento específico)
-            vencimentos_disponiveis = []
-            if "Vencimento" in df_opcoes_cache.columns:
-                vencs = pd.to_datetime(df_opcoes_cache["Vencimento"], errors="coerce").dropna().unique().tolist()
-                vencimentos_disponiveis = sorted(vencs)
-
-            vencimentos_sel = []
-            if vencimentos_disponiveis:
-                vencimentos_sel = st.multiselect(
-                    "Data de vencimento (opcional)",
-                    options=vencimentos_disponiveis,
-                    default=[],
-                    help="Se vazio, considera todos os vencimentos.",
-                )
-
-            df_opcoes_filtrado = filtrar_opcoes(
-                df_opcoes_cache,
-                distancia_min=distancia_min,
-                distancia_max=distancia_max,
-                vencimentos=vencimentos_sel if vencimentos_sel else None,
-                meses_vencimento=meses_sel if meses_sel else None,
+        col_sel1, col_sel2 = st.columns([2, 1])
+        with col_sel1:
+            modo_ativo = st.radio(
+                "Como escolher o ativo base",
+                options=["Selecionar da carteira", "Digitar"],
+                horizontal=True,
+                key="opnet_modo_ativo",
             )
 
-            if df_opcoes_filtrado.empty:
-                st.warning("Nenhuma opção encontrada com os filtros aplicados")
+            ativo_base = ""
+            if modo_ativo == "Selecionar da carteira" and acoes_disponiveis:
+                default_sel = st.session_state.get("opnet_ativo_sel")
+                idx = acoes_disponiveis.index(default_sel) if default_sel in acoes_disponiveis else 0
+                ativo_base = st.selectbox(
+                    "Ativo base (B3)",
+                    options=acoes_disponiveis,
+                    index=idx,
+                    key="opnet_ativo_sel",
+                    help="Escolha um ticker da sua carteira (B3).",
+                )
             else:
-                st.success(f"✅ {len(df_opcoes_filtrado)} opções encontradas")
-
-                cols_tabela = [
-                    c
-                    for c in [
-                        "Mês Vencimento",
-                        "Vencimento",
-                        "Strike",
-                        "Distância %",
-                        "Last Price",
-                        "Bid",
-                        "Ask",
-                        "Volume",
-                        "Open Interest",
-                    ]
-                    if c in df_opcoes_filtrado.columns
-                ]
-
-                df_show = df_opcoes_filtrado[cols_tabela].copy()
-                st.dataframe(
-                    df_show.style.format({
-                        "Strike": "R$ {:.2f}",
-                        "Distância %": "{:.2f}%",
-                        "Last Price": "R$ {:.2f}",
-                        "Bid": "R$ {:.2f}",
-                        "Ask": "R$ {:.2f}",
-                        "Volume": "{:,.0f}",
-                        "Open Interest": "{:,.0f}",
-                    }),
-                    use_container_width=True,
-                    height=420,
+                ativo_base = st.text_input(
+                    "Ativo base (B3)",
+                    value=st.session_state.get("opnet_ativo_text", ""),
+                    placeholder="Ex: PETR4, VALE3, BBAS3",
+                    help="Digite o ticker do ativo base (sem .SA).",
+                    key="opnet_ativo_text",
                 )
 
-        if (not fonte_dados.startswith("yfinance")) and isinstance(df_opcoesnet_cache, pd.DataFrame) and not df_opcoesnet_cache.empty:
+            # Normalizar ticker: remover .SA, espaços extras, parte após '-'
+            ativo_base = (ativo_base or "").strip().upper()
+            ativo_base = " ".join(ativo_base.split())  # Remove quebras de linha e espaços duplos
+            if " - " in ativo_base:
+                ativo_base = ativo_base.split(" - ", 1)[0].strip()
+            if ativo_base.endswith(".SA"):
+                ativo_base = ativo_base[:-3]
+            st.session_state["opnet_ativo_base"] = ativo_base
+
+            if modo_ativo == "Selecionar da carteira" and not acoes_disponiveis:
+                st.info("Sua carteira ainda não tem ações listadas aqui; use 'Digitar'.")
+
+        with col_sel2:
+            buscar_todos_vencimentos = st.checkbox(
+                "Todos vencimentos",
+                value=False,
+                help="Se marcado, ignora seleção de mês e busca todos os vencimentos (pode demorar).",
+                key="opnet_todos_venc",
+            )
+
+        # Seleção única de mês (antes de atualizar)
+        vencimentos_sel_opnet = None
+        venc_series = None
+        meses_from_vencs: list[str] = []
+
+        if ativo_base and not buscar_todos_vencimentos:
+            try:
+                vencs_raw = _listar_vencimentos_opcoesnet_cached(ativo_base)
+            except Exception as e:
+                vencs_raw = []
+                st.warning(f"⚠️ Não foi possível listar vencimentos para {ativo_base}: {e}")
+
+            vencs_values = [
+                str(v.get("value"))
+                for v in vencs_raw
+                if isinstance(v, dict) and v.get("value")
+            ]
+
+            if vencs_values:
+                venc_series = pd.to_datetime(pd.Series(vencs_values), errors="coerce")
+                meses_from_vencs = sorted(
+                    venc_series.dt.strftime("%m/%Y").dropna().unique().tolist()
+                )
+
+        meses_prev = st.session_state.get("opnet_meses_sel", [])
+        meses_default = [m for m in (meses_prev or []) if m in meses_from_vencs]
+        if not meses_default and meses_from_vencs:
+            meses_default = meses_from_vencs[:3] if len(meses_from_vencs) > 3 else meses_from_vencs
+
+        meses_opnet = st.multiselect(
+            "Mês de vencimento",
+            options=meses_from_vencs,
+            default=meses_default,
+            help="Selecione antes de atualizar para baixar menos dados.",
+            key="opnet_meses_sel",
+            disabled=(not ativo_base or buscar_todos_vencimentos or not meses_from_vencs),
+        )
+
+        if not ativo_base:
+            st.caption("Digite/seleciona um ativo para carregar os vencimentos.")
+        elif buscar_todos_vencimentos:
+            st.caption("Busca por todos os vencimentos está ativa.")
+        elif not meses_from_vencs:
+            st.caption("Nenhum vencimento listado para este ativo (ou endpoint indisponível).")
+        elif meses_opnet and venc_series is not None:
+            mask = venc_series.dt.strftime("%m/%Y").isin(meses_opnet)
+            vencimentos_sel_opnet = (
+                venc_series[mask].dt.strftime("%Y-%m-%d").dropna().unique().tolist()
+            )
+            st.caption(f"📅 {len(vencimentos_sel_opnet)} vencimento(s) selecionado(s)")
+
+        # Filtros (aplicados no resultado já carregado)
+        st.markdown("### Filtros (opcional)")
+        col_f1, col_f2, col_f3 = st.columns(3)
+        with col_f1:
+            filtro_codigo = st.text_input(
+                "Filtrar por código da opção (opcional)",
+                placeholder="Ex: BBASA...",
+                key="opnet_filtro_codigo",
+            )
+        with col_f2:
+            tipos_sel = st.multiselect(
+                "Tipo (opcional)",
+                options=["CALL", "PUT"],
+                default=["CALL", "PUT"],
+                key="opnet_filtro_tipo",
+            )
+        with col_f3:
+            filtro_dist_pct = st.slider(
+                "Distância máxima do Strike (%)",
+                min_value=0.0,
+                max_value=50.0,
+                value=10.0,
+                step=0.5,
+                help="Filtra por |(Strike - Preço Atual)/Preço Atual| ≤ X% (módulo, sem sinal).",
+                key="opnet_filtro_dist_pct",
+            )
+
+        if st.button("🔄 Atualizar opções (opcoes.net.br)", type="primary"):
+            if not ativo_base:
+                st.warning("⚠️ Informe o Ativo base (ex: BBAS3) para atualizar.")
+                st.stop()
+
+            try:
+                venc_info = (
+                    f" ({len(vencimentos_sel_opnet)} vencimentos)" if vencimentos_sel_opnet else " (vencimento padrão)"
+                )
+                with st.spinner(f"Baixando opções de {ativo_base}{venc_info}..."):
+                    df_new = buscar_opcoes_opcoesnet_bovespa(
+                        id_acao=ativo_base,
+                        todos_vencimentos=buscar_todos_vencimentos,
+                        vencimentos=vencimentos_sel_opnet,
+                    )
+
+                # Aplicar filtros escolhidos (uma única vez, conforme solicitado)
+                df_show = df_new.copy()
+                if tipos_sel and "TIPO" in df_show.columns:
+                    df_show = df_show[df_show["TIPO"].astype(str).isin(tipos_sel)]
+                if filtro_codigo and "CODIGO" in df_show.columns:
+                    # Normalizar código: remover espaços e fazer match parcial
+                    filtro_normalizado = str(filtro_codigo).strip().upper().replace(" ", "")
+                    df_show = df_show[
+                        df_show["CODIGO"].astype(str).str.upper().str.replace(" ", "", regex=False).str.contains(filtro_normalizado, na=False, regex=False)
+                    ]
+
+                if df_show.empty:
+                    st.warning(f"⚠️ Nenhuma opção encontrada para {ativo_base} com os filtros aplicados")
+                    st.session_state["opcoesnet_df_cache"] = pd.DataFrame()
+                    df_opcoesnet_cache = pd.DataFrame()
+                else:
+                    # Overwrite do cache (reduz memória; evita manter múltiplos ativos)
+                    salvar_cache_opcoesnet(df_show)
+                    st.session_state["opcoesnet_df_cache"] = df_show
+                    df_opcoesnet_cache = df_show
+
+                    vencs_unicos = sorted(df_show["VENCIMENTO"].dropna().unique()) if "VENCIMENTO" in df_show.columns else []
+                    st.success(
+                        f"✅ {len(df_show)} opções carregadas para {ativo_base} ({len(vencs_unicos)} vencimentos)"
+                    )
+            except LayoutOpcoesNetMudouError as e:
+                st.error(f"⚠️ Layout do site mudou: {e}")
+            except Exception as e:
+                st.error(f"❌ Erro ao buscar opções: {e}")
+                with st.expander("🐛 Detalhes do erro (debug)"):
+                    import traceback
+                    st.code(traceback.format_exc())
+
+        # Renderizar tabela a partir do cache (último resultado carregado)
+        if isinstance(df_opcoesnet_cache, pd.DataFrame) and not df_opcoesnet_cache.empty:
             st.markdown("---")
             st.subheader("Tabela (opcoes.net.br)")
 
-            col_n1, col_n2 = st.columns(2)
-            with col_n1:
-                filtro_ativo = None
-                if acoes_disponiveis:
-                    filtro_ativo = st.selectbox(
-                        "Filtrar por ativo (opcional)",
-                        options=[""] + acoes_disponiveis,
-                        index=0,
-                        help="Filtra a tabela geral pelo ativo subjacente (se a coluna existir).",
-                    )
-                else:
-                    filtro_ativo = st.text_input("Filtrar por ativo (opcional)", placeholder="Ex: PETR4")
+            df_show_net = df_opcoesnet_cache.copy()
 
-            with col_n2:
-                filtro_codigo = st.text_input(
-                    "Filtrar por código da opção (opcional)",
-                    placeholder="Ex: PETRA123",
+            # Preço atual (yfinance) e distância percentual Strike vs preço atual
+            ativo_ref = (st.session_state.get("opnet_ativo_base") or "").strip().upper()
+            if not ativo_ref and "ATIVO" in df_show_net.columns:
+                try:
+                    ativo_ref = str(df_show_net["ATIVO"].dropna().astype(str).iloc[0]).strip().upper()
+                except Exception:
+                    ativo_ref = ""
+
+            preco_atual_acao = _obter_preco_atual_acao_yf_cached(ativo_ref) if ativo_ref else None
+            if preco_atual_acao is not None and "STRIKE" in df_show_net.columns:
+                strike_num = pd.to_numeric(df_show_net["STRIKE"], errors="coerce")
+                df_show_net["Preço Atual"] = float(preco_atual_acao)
+                df_show_net["Diferença Strike (%)"] = ((strike_num - float(preco_atual_acao)) / float(preco_atual_acao)) * 100.0
+            elif ativo_ref:
+                st.caption("Não foi possível obter preço atual via yfinance; filtro de distância do strike ficará indisponível.")
+
+            # Filtrar por distância (módulo, sem sinal)
+            if "Diferença Strike (%)" in df_show_net.columns:
+                dist_num = pd.to_numeric(df_show_net["Diferença Strike (%)"], errors="coerce")
+                df_show_net = df_show_net[dist_num.abs() <= float(filtro_dist_pct)].copy()
+
+            if df_show_net.empty:
+                st.warning("⚠️ Nenhuma opção dentro do filtro de distância do strike.")
+                st.stop()
+
+            cols_net = [
+                c
+                for c in [
+                    "ATIVO",
+                    "CODIGO",
+                    "TIPO",
+                    "Preço Atual",
+                    "STRIKE",
+                    "Diferença Strike (%)",
+                    "VENCIMENTO",
+                    "Mês Vencimento",
+                    "PREMIO",
+                    "Fonte",
+                    "Coletado Em",
+                ]
+                if c in df_show_net.columns
+            ]
+            df_show_net = df_show_net[cols_net].copy() if cols_net else df_show_net
+
+            fmt = {}
+            if "Preço Atual" in df_show_net.columns:
+                fmt["Preço Atual"] = "R$ {:.2f}"
+            if "STRIKE" in df_show_net.columns:
+                fmt["STRIKE"] = "R$ {:.2f}"
+            if "PREMIO" in df_show_net.columns:
+                fmt["PREMIO"] = "R$ {:.2f}"
+            if "Diferença Strike (%)" in df_show_net.columns:
+                fmt["Diferença Strike (%)"] = "{:.2f}%"
+
+            styler = df_show_net.style.format(fmt)
+            if "Diferença Strike (%)" in df_show_net.columns:
+                try:
+                    styler = styler.bar(
+                        subset=["Diferença Strike (%)"],
+                        align="mid",
+                        vmin=-float(filtro_dist_pct),
+                        vmax=float(filtro_dist_pct),
+                    )
+                except Exception:
+                    pass
+
+            st.dataframe(styler, use_container_width=True, height=520)
+
+            col_e1, col_e2 = st.columns(2)
+            with col_e1:
+                csv_bytes = df_show_net.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "⬇️ Baixar CSV",
+                    data=csv_bytes,
+                    file_name="opcoes_opcoesnet_b3.csv",
+                    mime="text/csv",
                 )
-
-            tipos_disponiveis = []
-            if "TIPO" in df_opcoesnet_cache.columns:
-                tipos_disponiveis = [t for t in sorted(df_opcoesnet_cache["TIPO"].dropna().astype(str).unique().tolist()) if t]
-            tipos_sel = st.multiselect("Tipo (opcional)", options=tipos_disponiveis, default=tipos_disponiveis)
-
-            df_net = df_opcoesnet_cache.copy()
-            if "VENCIMENTO" in df_net.columns:
-                venc = pd.to_datetime(df_net["VENCIMENTO"], errors="coerce")
-                df_net["Mês Vencimento"] = venc.dt.strftime("%m/%Y")
-
-            if filtro_ativo:
-                if "ATIVO" in df_net.columns:
-                    df_net = df_net[df_net["ATIVO"].astype(str).str.upper().str.contains(str(filtro_ativo).upper(), na=False)]
-            if filtro_codigo:
-                if "CODIGO" in df_net.columns:
-                    df_net = df_net[df_net["CODIGO"].astype(str).str.upper().str.contains(str(filtro_codigo).upper(), na=False)]
-            if tipos_sel:
-                if "TIPO" in df_net.columns:
-                    df_net = df_net[df_net["TIPO"].astype(str).isin(tipos_sel)]
-            if meses_sel:
-                if "Mês Vencimento" in df_net.columns:
-                    df_net = df_net[df_net["Mês Vencimento"].isin(meses_sel)]
-
-            if df_net.empty:
-                st.warning("Nenhuma opção encontrada com os filtros aplicados")
-            else:
-                st.success(f"✅ {len(df_net)} opções encontradas")
-
-                cols_net = [c for c in ["ATIVO", "CODIGO", "TIPO", "STRIKE", "VENCIMENTO", "Mês Vencimento", "PREMIO", "Fonte", "Coletado Em"] if c in df_net.columns]
-                df_show_net = df_net[cols_net].copy()
-
-                fmt = {}
-                if "STRIKE" in df_show_net.columns:
-                    fmt["STRIKE"] = "R$ {:.2f}"
-                if "PREMIO" in df_show_net.columns:
-                    fmt["PREMIO"] = "R$ {:.2f}"
-
-                st.dataframe(df_show_net.style.format(fmt), use_container_width=True, height=520)
-
-                # Export
-                col_e1, col_e2 = st.columns(2)
-                with col_e1:
-                    csv_bytes = df_show_net.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "⬇️ Baixar CSV",
-                        data=csv_bytes,
-                        file_name="opcoes_opcoesnet_b3.csv",
-                        mime="text/csv",
-                    )
-                with col_e2:
-                    xlsx_bytes = exportar_opcoesnet_para_excel(df_show_net)
-                    st.download_button(
-                        "⬇️ Baixar Excel",
-                        data=xlsx_bytes,
-                        file_name="opcoes_opcoesnet_b3.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
+            with col_e2:
+                xlsx_bytes = exportar_opcoesnet_para_excel(df_show_net)
+                st.download_button(
+                    "⬇️ Baixar Excel",
+                    data=xlsx_bytes,
+                    file_name="opcoes_opcoesnet_b3.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
     
     # ===== SUBTAB: REGISTRAR VENDA =====
     with subtab_registro:
@@ -1560,7 +1628,38 @@ with tab_consolidacao:
                     df_consolidado_geral["Valor"] = df_consolidado_geral["Valor de Mercado"]
             df_view = aplicar_filtros_padrao(df_consolidado_geral, "cons_geral")
             df_view_enriquecido = enriquecer_com_setor_segmento(df_view)
-            exibir_metricas_valor(df_view_enriquecido, salvar_no_session_state_key="valor_total_consolidado_mes")
+            
+            # Preparar DataFrame do mês anterior para comparação
+            df_mes_anterior_inv = None
+            mes_atual_sel = st.session_state.get("cons_geral_mes_value")
+            try:
+                if mes_atual_sel and "Mês/Ano" in df_consolidado_geral.columns:
+                    # Converter mês atual para datetime e calcular mês anterior
+                    from datetime import datetime
+                    from dateutil.relativedelta import relativedelta
+                    dt_atual = datetime.strptime(f"01/{mes_atual_sel}", "%d/%m/%Y")
+                    dt_anterior = dt_atual - relativedelta(months=1)
+                    mes_anterior_str = dt_anterior.strftime("%m/%Y")
+                    
+                    # Filtrar pelo mês anterior
+                    df_mes_anterior_inv = df_consolidado_geral[
+                        df_consolidado_geral["Mês/Ano"] == mes_anterior_str
+                    ].copy()
+                    if not df_mes_anterior_inv.empty:
+                        df_mes_anterior_inv = enriquecer_com_setor_segmento(df_mes_anterior_inv)
+                        if "Valor" not in df_mes_anterior_inv.columns:
+                            if "Valor de Mercado" in df_mes_anterior_inv.columns:
+                                df_mes_anterior_inv["Valor"] = df_mes_anterior_inv["Valor de Mercado"]
+            except Exception:
+                df_mes_anterior_inv = None
+                mes_anterior_str = None
+            
+            exibir_metricas_valor(
+                df_view_enriquecido,
+                salvar_no_session_state_key="valor_total_consolidado_mes",
+                df_mes_anterior=df_mes_anterior_inv,
+                label_comparacao=mes_anterior_str if df_mes_anterior_inv is not None else None
+            )
 
             with st.expander("📋 Ver Tabela Completa", expanded=False):
                 st.dataframe(df_view_enriquecido, use_container_width=True)
@@ -2389,62 +2488,192 @@ with tab_posicao:
 
         df_view_enriquecido = enriquecer_com_setor_segmento(df_view)
 
-        # Cards (padrão mercado): Total + USD/BRL + EUR/BRL (com variação %)
+        # Cards: USD/BRL + EUR/BRL com variação %
         st.markdown("---")
-        c1, c2, c3 = st.columns(3)
-        total_val = float(pd.to_numeric(df_view_enriquecido.get("Valor"), errors="coerce").fillna(0).sum())
-        
-        # Comparar com o valor total do mês selecionado na consolidação
-        # Usar o valor já calculado e armazenado no session_state
-        pct_evolucao = None
-        mes_comparacao = None
-        try:
-            mes_selecionado = st.session_state.get("cons_geral_mes_value")
-            valor_consolidado_mes = st.session_state.get("valor_total_consolidado_mes")
-            
-            if mes_selecionado and valor_consolidado_mes and valor_consolidado_mes > 0:
-                pct_evolucao = ((total_val - valor_consolidado_mes) / valor_consolidado_mes) * 100.0
-                mes_comparacao = mes_selecionado
-        except Exception:
-            pass
-        
-        with c1:
-            if pct_evolucao is not None:
-                st.metric("💰 Valor Total (Atualizado)", f"R$ {total_val:,.2f}", f"{pct_evolucao:+.2f}% vs {mes_comparacao}")
-            else:
-                st.metric("💰 Valor Total (Atualizado)", f"R$ {total_val:,.2f}")
-
-        def _cotacao_e_delta(indice: str):
+        with st.container():
+            cols = st.columns([1,1,1,1])
+            # Valor Total (primeira coluna)
+            valor_total = None
+            delta_total = None
+            label_comparacao = None
+            # Recupera os valores já calculados para exibir
             try:
-                h = obter_historico_indice(indice, periodo="10d", intervalo="1d")
-                if h is None or h.empty or "Close" not in h.columns:
-                    return None, None
-                close = pd.to_numeric(h["Close"], errors="coerce").dropna()
-                if close.size < 2:
-                    return float(close.iloc[-1]) if close.size else None, None
-                last = float(close.iloc[-1])
-                prev = float(close.iloc[-2])
-                if prev <= 0:
-                    return last, None
-                return last, (last / prev - 1.0) * 100.0
+                df_metricas = df_view_enriquecido.copy()
+                valor_total = pd.to_numeric(df_metricas["Valor"], errors="coerce").fillna(0).sum()
+                # Recupera delta e label do consolidado
+                mes_comparacao = st.session_state.get("cons_geral_mes_value") or st.session_state.get("posicao_atual_mes")
+                df_mes_comparacao = None
+                if mes_comparacao:
+                    frames_ref = []
+                    if not df_padronizado.empty:
+                        frames_ref.append(df_padronizado.copy())
+                    if not df_acoes_avenue_padrao.empty:
+                        frames_ref.append(df_acoes_avenue_padrao.copy())
+                    if not df_caixa_consolidado_pos.empty:
+                        frames_ref.append(df_caixa_consolidado_pos.copy())
+                    if not df_acoes_man_consolidado_pos.empty:
+                        frames_ref.append(df_acoes_man_consolidado_pos.copy())
+                    df_ref = pd.concat(frames_ref, ignore_index=True) if frames_ref else pd.DataFrame()
+                    if not df_ref.empty and "Mês/Ano" in df_ref.columns:
+                        df_mes_comparacao = df_ref[df_ref["Mês/Ano"] == mes_comparacao]
+                        valor_anterior = pd.to_numeric(df_mes_comparacao["Valor"], errors="coerce").fillna(0).sum()
+                        if valor_anterior > 0:
+                            delta_total = ((valor_total - valor_anterior) / valor_anterior) * 100.0
+                            label_comparacao = mes_comparacao
             except Exception:
-                return None, None
+                pass
+            with cols[0]:
+                if delta_total is not None and label_comparacao:
+                    st.metric("💰 Valor Total", f"R$ {valor_total:,.2f}", f"{delta_total:+.2f}% vs {label_comparacao}")
+                else:
+                    st.metric("💰 Valor Total", f"R$ {valor_total:,.2f}")
+            def _cotacao_e_delta(indice: str):
+                try:
+                    h = obter_historico_indice(indice, periodo="10d", intervalo="1d")
+                    if h is None or h.empty or "Close" not in h.columns:
+                        return None, None
+                    close = pd.to_numeric(h["Close"], errors="coerce").dropna()
+                    if close.size < 2:
+                        return float(close.iloc[-1]) if close.size else None, None
+                    last = float(close.iloc[-1])
+                    prev = float(close.iloc[-2])
+                    if prev <= 0:
+                        return last, None
+                    return last, (last / prev - 1.0) * 100.0
+                except Exception:
+                    return None, None
 
-        usd, usd_delta = _cotacao_e_delta("USD/BRL")
-        eur, eur_delta = _cotacao_e_delta("EUR/BRL")
-        with c2:
-            if usd is None:
-                st.metric("USD/BRL", "—")
-            else:
-                st.metric("USD/BRL", f"R$ {usd:,.4f}", (f"{usd_delta:+.2f}%" if usd_delta is not None else None))
-        with c3:
-            if eur is None:
-                st.metric("EUR/BRL", "—")
-            else:
-                st.metric("EUR/BRL", f"R$ {eur:,.4f}", (f"{eur_delta:+.2f}%" if eur_delta is not None else None))
+            usd, usd_delta = _cotacao_e_delta("USD/BRL")
+            eur, eur_delta = _cotacao_e_delta("EUR/BRL")
+            with cols[1]:
+                if usd is None:
+                    st.metric("USD/BRL", "—")
+                else:
+                    st.metric("USD/BRL", f"R$ {usd:,.4f}", (f"{usd_delta:+.2f}%" if usd_delta is not None else None))
+            with cols[2]:
+                if eur is None:
+                    st.metric("EUR/BRL", "—")
+                else:
+                    st.metric("EUR/BRL", f"R$ {eur:,.4f}", (f"{eur_delta:+.2f}%" if eur_delta is not None else None))
+            with cols[3]:
+                st.empty()
 
-        # Mantém o detalhamento por tipo (mesmo padrão de Investimento)
-        # exibir_metricas_valor(df_view_enriquecido, col_valor="Valor")  # Removido para evitar duplicidade visual
+        # Detalhamento por tipo com comparação usando o MES SELECIONADO (mesmos filtros da tela)
+        st.markdown("---")
+
+        df_mes_comparacao = None
+        # Referência: mês selecionado no CONSOLIDADO (fallback: mês selecionado na própria aba)
+        mes_comparacao = st.session_state.get("cons_geral_mes_value") or st.session_state.get("posicao_atual_mes")
+
+        def _resolver_todos(raw_sel, valores_unicos):
+            raw_sel = raw_sel or []
+            if not isinstance(raw_sel, (list, tuple)):
+                raw_sel = [raw_sel]
+            raw_sel = [v for v in raw_sel if v is not None]
+            if "Todos" in raw_sel:
+                return list(valores_unicos)
+            return list(raw_sel)
+
+        try:
+            if mes_comparacao:
+                # IMPORTANTE: usar consolidado em BRL como referência.
+                # Para Posição Atual, `df_acoes_avenue_pos_usd` fica em USD (para recalcular com câmbio atual),
+                # mas a referência do mês (consolidado) deve usar `df_acoes_avenue_padrao` (já convertida para BRL).
+                frames_ref = []
+                if not df_padronizado.empty:
+                    frames_ref.append(df_padronizado.copy())
+                if not df_acoes_avenue_padrao.empty:
+                    frames_ref.append(df_acoes_avenue_padrao.copy())
+                if not df_caixa_consolidado_pos.empty:
+                    frames_ref.append(df_caixa_consolidado_pos.copy())
+                if not df_acoes_man_consolidado_pos.empty:
+                    frames_ref.append(df_acoes_man_consolidado_pos.copy())
+
+                df_ref = pd.concat(frames_ref, ignore_index=True) if frames_ref else pd.DataFrame()
+                if df_ref.empty:
+                    df_mes_comparacao = None
+                else:
+                    df_mes_comparacao = df_ref.copy()
+                if "Mês/Ano" in df_mes_comparacao.columns:
+                    df_mes_comparacao = df_mes_comparacao[df_mes_comparacao["Mês/Ano"] == mes_comparacao]
+
+                # Aplicar mesmos filtros da aba Posição Atual (usuário/tipo)
+                if "Usuário" in df_mes_comparacao.columns:
+                    usuarios_unicos = sorted(df_mes_comparacao["Usuário"].dropna().unique())
+                    usuarios_sel = _resolver_todos(st.session_state.get("posicao_atual_user"), usuarios_unicos)
+                    if usuarios_sel:
+                        df_mes_comparacao = df_mes_comparacao[df_mes_comparacao["Usuário"].isin(usuarios_sel)]
+
+                if "Tipo" in df_mes_comparacao.columns:
+                    tipos_unicos = sorted(df_mes_comparacao["Tipo"].dropna().unique())
+                    tipos_sel = _resolver_todos(st.session_state.get("posicao_atual_tipo"), tipos_unicos)
+                    if tipos_sel:
+                        df_mes_comparacao = df_mes_comparacao[df_mes_comparacao["Tipo"].isin(tipos_sel)]
+
+                # Coluna de valor de referência
+                if "Valor" in df_mes_comparacao.columns:
+                    # Não forçar to_numeric aqui (pode ter 'R$'/'US$'); o parse robusto é feito em exibir_metricas_valor
+                    df_mes_comparacao["Valor"] = df_mes_comparacao["Valor"]
+                elif "Valor de Mercado" in df_mes_comparacao.columns:
+                    df_mes_comparacao["Valor"] = df_mes_comparacao["Valor de Mercado"]
+                else:
+                    df_mes_comparacao = None
+
+                if df_mes_comparacao is not None and not df_mes_comparacao.empty:
+                    df_mes_comparacao = enriquecer_com_setor_segmento(df_mes_comparacao)
+                else:
+                    df_mes_comparacao = None
+        except Exception:
+            df_mes_comparacao = None
+
+        # Exibir métricas detalhadas, mas ocultar o campo '💰 Valor Total'
+        def exibir_metricas_valor_sem_total(df, col_valor="Valor", salvar_no_session_state_key=None, df_mes_anterior=None, label_comparacao=None):
+            import unicodedata
+            def _norm_tipo(v) -> str:
+                s = "" if pd.isna(v) else str(v)
+                s = unicodedata.normalize("NFKD", s)
+                s = "".join(ch for ch in s if not unicodedata.combining(ch))
+                s = " ".join(s.strip().split())
+                return s.lower()
+            # Por tipo se disponível
+            if "Tipo" in df.columns:
+                df_tmp = df.copy()
+                df_tmp["_tipo_norm"] = df_tmp["Tipo"].apply(_norm_tipo)
+                df_prev = None
+                if df_mes_anterior is not None and not df_mes_anterior.empty and "Tipo" in df_mes_anterior.columns:
+                    df_prev = df_mes_anterior.copy()
+                    df_prev["_tipo_norm"] = df_prev["Tipo"].apply(_norm_tipo)
+                tipos = df_tmp["Tipo"].dropna().unique()
+                if len(tipos) > 1:
+                    st.markdown("---")
+                    st.subheader("Por Tipo")
+                    cols = st.columns(min(len(tipos), 4))
+                    for idx, tipo in enumerate(sorted(tipos)):
+                        with cols[idx % 4]:
+                            tipo_norm = _norm_tipo(tipo)
+                            valor_tipo = pd.to_numeric(
+                                df_tmp[df_tmp["_tipo_norm"] == tipo_norm][col_valor],
+                                errors="coerce",
+                            ).fillna(0).sum()
+                            delta_tipo = None
+                            if df_prev is not None and col_valor in df_prev.columns:
+                                valor_tipo_anterior = pd.to_numeric(
+                                    df_prev[df_prev["_tipo_norm"] == tipo_norm][col_valor],
+                                    errors="coerce",
+                                ).fillna(0).sum()
+                                if valor_tipo_anterior > 0:
+                                    delta_tipo = ((valor_tipo - valor_tipo_anterior) / valor_tipo_anterior) * 100.0
+                            if delta_tipo is not None and label_comparacao:
+                                st.metric(tipo, f"R$ {valor_tipo:,.2f}", f"{delta_tipo:+.2f}% vs {label_comparacao}")
+                            else:
+                                st.metric(tipo, f"R$ {valor_tipo:,.2f}")
+
+        exibir_metricas_valor_sem_total(
+            df_view_enriquecido,
+            col_valor="Valor",
+            df_mes_anterior=df_mes_comparacao,
+            label_comparacao=mes_comparacao
+        )
 
         # Painéis: Top 10 Altas / Top 10 Baixas (apenas ativos com posição no mês selecionado)
         st.markdown("---")
@@ -2452,23 +2681,64 @@ with tab_posicao:
         base_mov = df_view_enriquecido.copy()
         base_mov["Variação %"] = pd.to_numeric(base_mov.get("Variação %"), errors="coerce")
         base_mov = base_mov.dropna(subset=["Variação %"]).copy()
-        cols_mov = [c for c in ["Ticker", "Tipo", "Variação %", "Preço Histórico (BRL)", "Preço Atual", "Valor Atualizado"] if c in base_mov.columns]
+        # Ganho/Perda no dia (R$) baseado no % do dia e no valor atual da posição:
+        # exemplo: alta 3% e saldo atual 103k -> base = 103k/1.03 = 100k -> ganho = 3k
+        if "Valor Atualizado" in base_mov.columns:
+            _pct = pd.to_numeric(base_mov["Variação %"], errors="coerce") / 100.0
+            _va = pd.to_numeric(base_mov["Valor Atualizado"], errors="coerce")
+            _den = (1.0 + _pct).replace(0, np.nan)
+            base_mov["Variação Dia (R$)"] = _va - (_va / _den)
+        cols_mov = [c for c in ["Ticker", "Tipo", "Variação %", "Variação Dia (R$)", "Preço Atual", "Valor Atualizado"] if c in base_mov.columns]
+
+        def _plot_bar_degrade(df, valor_col, label_col, titulo, key, valor_atualizado_col="Valor Atualizado", preco_hist_col="Preço Histórico (BRL)"):
+            if df.empty:
+                st.info("Sem ativos com posição no mês/ano selecionado.")
+                return
+            df_plot = df.copy()
+            # Calcular ganho/perda em R$ no dia a partir do % do dia e do valor atual da posição
+            if valor_atualizado_col in df_plot.columns and valor_col in df_plot.columns:
+                _pct = pd.to_numeric(df_plot[valor_col], errors="coerce") / 100.0
+                _va = pd.to_numeric(df_plot[valor_atualizado_col], errors="coerce")
+                _den = (1.0 + _pct).replace(0, np.nan)
+                df_plot["Variação Dia (R$)"] = _va - (_va / _den)
+                valor_col_grafico = "Variação Dia (R$)"
+                label_eixo = "Ganho/Perda no dia (R$)"
+            else:
+                valor_col_grafico = valor_col
+                label_eixo = valor_col
+            df_plot = df_plot.sort_values(valor_col_grafico, ascending=False).reset_index(drop=True)
+            fig = px.bar(
+                df_plot,
+                x=label_col,
+                y=valor_col_grafico,
+                title=titulo,
+                color=df_plot[valor_col_grafico],
+                color_continuous_scale=px.colors.sequential.Purples,
+                labels={label_col: "Ticker", valor_col_grafico: label_eixo},
+            )
+            fig.update_traces(marker_line_color="rgba(0,0,0,0)", textposition="outside", texttemplate="R$ %{y:,.0f}")
+            fig.update_layout(yaxis_tickformat=",.0f", margin=dict(t=60), coloraxis_showscale=False, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True, key=key)
 
         with col_up:
             st.subheader("📈 Maiores Altas (Top 10)")
-            if base_mov.empty:
-                st.info("Sem ativos com posição no mês/ano selecionado.")
+            if "Variação Dia (R$)" in base_mov.columns:
+                df_top_up = base_mov.nlargest(10, "Variação Dia (R$)")[cols_mov].copy()
             else:
                 df_top_up = base_mov.nlargest(10, "Variação %")[cols_mov].copy()
+            _plot_bar_degrade(df_top_up, "Variação %", "Ticker", "🏆 Top 10 Ticker - Altas", key="posicao_top10_up", valor_atualizado_col="Valor Atualizado", preco_hist_col="Preço Histórico (BRL)")
+            if not df_top_up.empty:
                 _, sty_up = preparar_tabela_posicao_estilizada(df_top_up)
                 st.dataframe(sty_up, use_container_width=True, hide_index=True)
 
         with col_down:
             st.subheader("📉 Maiores Baixas (Top 10)")
-            if base_mov.empty:
-                st.info("Sem ativos com posição no mês/ano selecionado.")
+            if "Variação Dia (R$)" in base_mov.columns:
+                df_top_down = base_mov.nsmallest(10, "Variação Dia (R$)")[cols_mov].copy()
             else:
                 df_top_down = base_mov.nsmallest(10, "Variação %")[cols_mov].copy()
+            _plot_bar_degrade(df_top_down, "Variação %", "Ticker", "🏆 Top 10 Ticker - Baixas", key="posicao_top10_down", valor_atualizado_col="Valor Atualizado", preco_hist_col="Preço Histórico (BRL)")
+            if not df_top_down.empty:
                 _, sty_down = preparar_tabela_posicao_estilizada(df_top_down)
                 st.dataframe(sty_down, use_container_width=True, hide_index=True)
 
@@ -2655,12 +2925,25 @@ with tab_outros:
                 c4.metric("📊 Rentabilidade (%)", f"{calc['rent_pct']:.2f}%")
                 st.caption(f"**Fórmula:** Rentabilidade (%) = ((Valor Final - Depósitos + Saques) - Valor Inicial) / Valor Inicial × 100")
 
+            # Fallback defensivo para evitar NameError caso o Streamlit reordene execução/hot-reload
+            nome_caixa = (
+                (locals().get("nome_caixa") or "")
+                or (st.session_state.get("caixa_nome") or "")
+                or "Caixa Principal"
+            )
+
+            usr_caixa_safe = (
+                (locals().get("usr_caixa") or "")
+                or (st.session_state.get("caixa_usr") or "")
+                or "Manual"
+            )
+
             if st.button("💾 Salvar Caixa", key="btn_reg_caixa", type="primary"):
                 try:
                     df_caixa_new = registrar_caixa(
                         mes_caixa,
                         val_caixa_ini,
-                        usuario=usr_caixa or "Manual",
+                        usuario=usr_caixa_safe,
                         depositos=dep_vals,
                         saques=saq_vals,
                         valor_final=val_caixa_fim,

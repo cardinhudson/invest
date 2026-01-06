@@ -708,10 +708,13 @@ def exibir_grafico_historico_cotacao(key_prefix=""):
 
 
 
-def aba_acoes_avenue():
+def aba_acoes_avenue(exibir_metricas_valor_fn=None):
     """
     Aba para visualização de ações extraídas dos PDFs Avenue.
     Inclui conversão de moeda, exibição de cotação e gráfico histórico.
+    
+    Args:
+        exibir_metricas_valor_fn: Função para exibir métricas com comparação vs mês anterior.
     """
     st.header("📈 Ações Avenue")
     
@@ -793,38 +796,6 @@ def aba_acoes_avenue():
         if "Preco_USD_Original" in df_visualizacao.columns:
             df_visualizacao["Preço"] = df_visualizacao["Preco_USD_Original"]
     
-    # ========== MÉTRICAS PRINCIPAIS ==========
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    
-    with col1:
-        st.metric("📊 Total de Posições", len(df_visualizacao))
-    
-    with col2:
-        valor_total = df_visualizacao.get("Valor de Mercado", pd.Series()).sum()
-        st.metric("💰 Valor Total de Mercado", formatar_valor_moeda(valor_total, moeda))
-    
-    with col3:
-        quantidade_total = df_visualizacao.get("Quantidade", pd.Series()).sum()
-        st.metric("📦 Quantidade Total", f"{quantidade_total:,.2f}")
-    
-    with col4:
-        if "Usuário" in df_visualizacao.columns:
-            usuarios = df_visualizacao["Usuário"].nunique()
-            st.metric("👤 Usuários", usuarios)
-        else:
-            st.metric("👤 Usuários", 0)
-    
-    with col5:
-        if mes_ano_ref:
-            st.metric(f"💱 Cotação ({mes_ano_ref})", f"R$ {cotacao_mes:.2f}")
-        else:
-            st.metric("💱 Cotação (Ref)", f"R$ {cotacao_mes:.2f}")
-    
-    with col6:
-        st.metric("💹 Cotação (Atual)", f"R$ {cotacao_atual:.2f}")
-    
-    st.markdown("---")
-    
     # ========== FILTROS ==========
     col_f1, col_f2, col_f3 = st.columns(3)
     
@@ -879,6 +850,63 @@ def aba_acoes_avenue():
     if "Mês/Ano" in df_visualizacao.columns:
         if 'mes_sel' in locals() and mes_sel:
             df_filtrado = df_filtrado[df_filtrado["Mês/Ano"] == mes_sel]
+    
+    # ========== MÉTRICAS COM COMPARAÇÃO VS MÊS ANTERIOR ==========
+    st.markdown("---")
+    
+    # Preparar DataFrame do mês anterior
+    df_mes_anterior_avenue = None
+    mes_anterior_str = None
+    try:
+        if mes_sel and "Mês/Ano" in df_visualizacao.columns:
+            from datetime import datetime
+            from dateutil.relativedelta import relativedelta
+            dt_atual = datetime.strptime(f"01/{mes_sel}", "%d/%m/%Y")
+            dt_anterior = dt_atual - relativedelta(months=1)
+            mes_anterior_str = dt_anterior.strftime("%m/%Y")
+            
+            df_mes_anterior_avenue = df_visualizacao[
+                df_visualizacao["Mês/Ano"] == mes_anterior_str
+            ].copy()
+            if not df_mes_anterior_avenue.empty:
+                # Adicionar coluna Tipo para compatibilidade com exibir_metricas_valor
+                df_mes_anterior_avenue["Tipo"] = "Ações Dólar"
+    except Exception:
+        df_mes_anterior_avenue = None
+        mes_anterior_str = None
+    
+    # Adicionar coluna Tipo para o DataFrame atual
+    df_filtrado_com_tipo = df_filtrado.copy()
+    df_filtrado_com_tipo["Tipo"] = "Ações Dólar"
+    
+    # Usar função exibir_metricas_valor se disponível
+    if exibir_metricas_valor_fn is not None:
+        try:
+            exibir_metricas_valor_fn(
+                df_filtrado_com_tipo,
+                col_valor="Valor de Mercado",
+                df_mes_anterior=df_mes_anterior_avenue,
+                label_comparacao=mes_anterior_str
+            )
+        except Exception as e:
+            # Em caso de erro, usar fallback
+            st.warning(f"Erro ao exibir métricas: {e}")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("💰 Valor Total de Mercado", formatar_valor_moeda(df_filtrado["Valor de Mercado"].sum(), moeda))
+            with col2:
+                st.metric("📊 Total de Posições", len(df_filtrado))
+            with col3:
+                st.metric("📦 Quantidade Total", f"{df_filtrado['Quantidade'].sum():,.2f}")
+    else:
+        # Fallback: exibir métricas básicas sem comparação
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("💰 Valor Total de Mercado", formatar_valor_moeda(df_filtrado["Valor de Mercado"].sum(), moeda))
+        with col2:
+            st.metric("📊 Total de Posições", len(df_filtrado))
+        with col3:
+            st.metric("📦 Quantidade Total", f"{df_filtrado['Quantidade'].sum():,.2f}")
     
     # ========== ORDENAÇÃO ==========
     col_ord1, col_ord2 = st.columns(2)

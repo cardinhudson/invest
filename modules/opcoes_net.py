@@ -160,7 +160,7 @@ def _cache_buster_5min() -> str:
 
 def _fetch_listaopcoes_completa(
     id_acao: str,
-    id_lista: str = "ML",
+    id_lista: str = "",
     listar_vencimentos: bool = True,
     vencimentos: list[str] | None = None,
     cotacoes: bool = True,
@@ -170,7 +170,7 @@ def _fetch_listaopcoes_completa(
         "cache": _cache_buster_5min(),
         "au": "False",
         "uinhc": "0",
-        "idLista": str(id_lista or "ML"),
+        "idLista": str(id_lista) if id_lista else "",
         "idAcao": str(id_acao or ""),
         "listarVencimentos": "true" if listar_vencimentos else "false",
         "cotacoes": "true" if cotacoes else "false",
@@ -198,7 +198,7 @@ def _fetch_listaopcoes_completa(
     return data
 
 
-def listar_vencimentos_opcoesnet(id_acao: str, id_lista: str = "ML", timeout: int = 30) -> list[dict]:
+def listar_vencimentos_opcoesnet(id_acao: str, id_lista: str = "", timeout: int = 30) -> list[dict]:
     """Lista vencimentos disponíveis no opcoes.net.br para um ativo base.
 
     Retorna itens como {"value": "YYYY-MM-DD", "text": "dd/mm", "selected": bool}.
@@ -220,7 +220,7 @@ def buscar_opcoes_opcoesnet_bovespa(
     url: str = OPCOESNET_URL,
     obrigatorias: list[str] | None = None,
     id_acao: str | None = None,
-    id_lista: str = "ML",
+    id_lista: str = "",
     todos_vencimentos: bool = False,
     vencimentos: list[str] | None = None,
 ) -> pd.DataFrame:
@@ -230,7 +230,7 @@ def buscar_opcoes_opcoesnet_bovespa(
 
     Args:
         id_acao: ticker B3 do ativo base (ex: PETR4). Recomendado para evitar downloads enormes.
-        id_lista: lista do site (default: 'ML' = Mais líquidos)
+        id_lista: lista do site (default: '' = todas as opções, incluindo menos líquidas. Use 'ML' para apenas mais líquidas)
         todos_vencimentos: se True, busca todos os vencimentos disponíveis (pode ser pesado)
 
     Raises:
