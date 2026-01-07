@@ -472,7 +472,7 @@ def gerar_graficos_evolucao(df: pd.DataFrame, coluna_valor: str = "Valor Líquid
         # Adicionar linha de média móvel se selecionada
         if periodo_mm != "Sem MM":
             periodo_num = int(periodo_mm.split()[0])
-            mm_values = pd.Series(df_group.values).rolling(window=periodo_num, center=True).mean()
+            mm_values = pd.Series(df_group.values).rolling(window=periodo_num, center=False, min_periods=1).mean()
             fig_bar.add_trace(
                 go.Scatter(
                     x=df_group.index,
