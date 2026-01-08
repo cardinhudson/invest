@@ -455,7 +455,7 @@ def gerar_graficos_evolucao(df: pd.DataFrame, coluna_valor: str = "Valor Líquid
         
         max_val = df_group.values.max() if len(df_group.values) else 0
         from plotly.colors import sample_colorscale
-        blues = px.colors.sequential.Blues[::-1]
+        blues = px.colors.sequential.Blues  # maior valor = azul mais escuro
         n = len(df_group)
         valores = np.array(df_group.values)
         norm = (valores - valores.min()) / (valores.max() - valores.min()) if valores.max() > valores.min() else np.full(n, 0.5)
@@ -743,7 +743,6 @@ def _obter_preco_atual_acao_yf_cached(ticker_base: str) -> float | None:
         return None
 
 
-@st.cache_data(show_spinner=False)
 def exibir_tabela_info_tickers(df, titulo="📄 Ticker / Setor / Fundamentais (yfinance)"):
     """Exibe tabela com tickers padronizados e informações de setor/fundamentos via yfinance."""
     if df.empty:
@@ -994,7 +993,7 @@ with tab_proventos:
                     .sum()
                     .sort_values(ascending=False)
                 )
-                paleta = px.colors.sequential.Blues[::-1]  # maior valor = mais escuro
+                paleta = px.colors.sequential.Blues  # maior valor = azul mais escuro
                 from plotly.colors import sample_colorscale
                 n = len(dist_fonte_br)
                 valores = dist_fonte_br.values
@@ -1090,8 +1089,8 @@ with tab_proventos:
                 st.markdown("---")
                 st.subheader("📊 Distribuição por Fonte")
                 dist_fonte = df_filtrado.groupby("Fonte Provento")["Valor Líquido"].sum().sort_values(ascending=False)
-                # Degrade: maior valor = cor mais escura
-                paleta = px.colors.sequential.Blues[::-1]
+                # Degrade: maior valor = cor mais escura (azul escuro)
+                paleta = px.colors.sequential.Blues
                 from plotly.colors import sample_colorscale
                 n = len(dist_fonte)
                 valores = dist_fonte.values
@@ -2560,6 +2559,12 @@ with tab_posicao:
         with col_a:
             if st.button("Atualizar cotações", key="posicao_atual_btn_atualizar"):
                 st.session_state["posicao_atual_forcar_update"] = True
+                st.session_state["posicao_atual_df"] = None
+                st.session_state["posicao_atual_sem_cotacao"] = None
+                st.session_state["posicao_atual_ultima_atualizacao"] = None
+                # Limpa caches para garantir atualização completa
+                st.cache_data.clear()
+                st.rerun()
 
         # Se a base mudou (ex: novo upload), força atualização
         try:

@@ -62,6 +62,9 @@ indice_selecionado = st.sidebar.radio(
     "Selecione a seção:",
     [
         "🏠 Visão Geral",
+        "🔁 Atualização de Cotações (Posição Atual)",
+        "🧮 Cálculos e Metodologias",
+        "🗄️ Cache e Persistência",
         "🏗️ Arquitetura e Estrutura",
         "📊 Módulos do Projeto",
         "💾 Banco de Dados",
@@ -130,6 +133,12 @@ if indice_selecionado == "🏠 Visão Geral":
     - **📊 Consolidação**: Visão única com todos os investimentos combinados (BR + Avenue) com:
         - **Investimento**: Filtros, métricas e gráficos de distribuição por tipo, setor e ativo.
         - **Rentabilidade**: Análise mensal de retorno por ativo usando quantidade do mês anterior (metodologia "sem aportes").
+    - **📊 Análise Fundamentalista**: Página dedicada a indicadores e demonstrativos via `yfinance`.
+        - **Periodicidade**: permite visualizar indicadores em **Mensal / Trimestral / Anual**.
+        - **Trimestral vs Anual (regra de prioridade)**: quando há dados trimestrais, o app usa o **relatório trimestral**; o **anual entra apenas como preenchimento** dos períodos onde não existe dado trimestral (ex.: anos antigos/linhas ausentes). Ou seja: **trimestral sempre prevalece**.
+        - **Projeção do período atual**: adiciona um ponto de **projeção** (mês atual / ano atual) recalculando apenas métricas dependentes do preço (ex.: **P/L, P/VP, Dividend Yield**) usando o **preço mais recente** e o **último resultado disponível** (preferência: trimestral).
+        - **Somente tickers válidos**: opção para filtrar listas/seleções e exibir somente tickers realmente existentes no Yahoo Finance (validação em lote com cache para performance).
+        - **Dividendos (datas futuras)**: exibe, quando disponível, uma tabela com **Ex-Dividend Date** e **Dividend Date** do `yfinance`.
     - **⚙️ Outros**: Cadastro de usuários e Inserção Manual.
     """)
     
@@ -141,6 +150,147 @@ if indice_selecionado == "🏠 Visão Geral":
     4. **Monitorar Oportunidades**: Alertar quando preços-alvo são atingidos
     5. **Acompanhar Dividendos**: Registrar e acompanhar histórico de dividendos recebidos
     """)
+
+# ==========================================
+# SEÇÃO: ATUALIZAÇÃO DE COTAÇÕES (POSIÇÃO ATUAL)
+# ==========================================
+elif indice_selecionado == "🔁 Atualização de Cotações (Posição Atual)":
+        st.header("🔁 Atualização de Cotações (Posição Atual)")
+
+        st.markdown("""
+        Esta seção explica **como funciona a aba 📌 Posição Atual**, o que o botão **Atualizar cotações** faz,
+        e como o sistema garante que tabelas e gráficos reflitam os dados mais recentes.
+        """)
+
+        st.subheader("✅ O que o botão faz")
+        st.markdown("""
+        Ao clicar em **Atualizar cotações** o app:
+        1. **Força** a atualização no `st.session_state`.
+        2. **Limpa o cache** do Streamlit via `st.cache_data.clear()`.
+        3. Executa um `st.rerun()` para reprocessar a página na mesma hora.
+
+        Isso evita o cenário clássico do Streamlit onde o usuário clica, mas o script não reexecuta e nada muda.
+        """)
+
+        st.subheader("📦 De onde vem o preço (yfinance)")
+        st.markdown("""
+        A atualização utiliza o `yfinance` para buscar:
+        - **Preço Atual** (preferencialmente `regularMarketPrice` / `currentPrice`).
+        - **Preço Anterior** (preferencialmente `previousClose`).
+        - **Variação % do dia** (preferencialmente `regularMarketChangePercent`).
+
+        Fallbacks (quando um campo não está disponível):
+        - Usa histórico de **5 dias** para estimar `Preço Atual` e `Preço Anterior` via `Close`.
+        - Calcula `Variação %` como $(PreçoAtual / PreçoAnterior - 1) \times 100$.
+        """)
+
+        st.subheader("🧾 Onde está o código")
+        st.markdown("""
+        - Atualização e cálculo de colunas: `modules/posicao_atual.py` → `atualizar_cotacoes()`
+        - Preparação da base para atualização (ticker/quantidade/valor base): `modules/posicao_atual.py` → `preparar_posicao_base()`
+        - Botão e fluxo de atualização na UI: `APP.py` (aba 📌 Posição Atual)
+        """)
+
+        st.subheader("🧠 Como interpretar as colunas")
+        st.markdown("""
+        - **Preço Atual**: cotação atual em BRL (para Ações Dólar, converte USD→BRL com câmbio atual).
+        - **Preço Anterior**: referência do dia (normalmente o fechamento anterior).
+        - **Variação %**: percentual do dia (yfinance ou cálculo por fallback).
+        - **Valor Atualizado**: valor atual da posição (detalhes na seção de cálculos).
+        - **Fonte Preço**: indica se veio do `yfinance` ou de fallback (histórico/base).
+        """)
+
+        st.subheader("🆘 Dicas de troubleshooting")
+        st.markdown("""
+        Se o preço atual mudar mas a **Variação %** não:
+        - Verifique se o yfinance está retornando `previousClose` / `regularMarketChangePercent`.
+        - Em horários fora de pregão, é comum a variação refletir o último fechamento.
+        - O botão já limpa o cache; se persistir, reinicie o Streamlit para zerar estado de sessão.
+        """)
+
+# ==========================================
+# SEÇÃO: CÁLCULOS E METODOLOGIAS
+# ==========================================
+elif indice_selecionado == "🧮 Cálculos e Metodologias":
+        st.header("🧮 Cálculos e Metodologias")
+
+        st.markdown("""
+        Esta seção centraliza as **regras de cálculo** usadas nos painéis, para facilitar manutenção e reprocessamento.
+        """)
+
+        st.subheader("💰 Valor Atualizado (Posição Atual)")
+        st.markdown("""
+        Para cada linha da posição atual:
+
+        - Se o ativo é **Ações** / **Ações Dólar**:
+            $$ValorAtualizado = Quantidade \times PreçoAtual$$
+
+        - Para demais tipos (ex.: RF, TD, caixa, etc.):
+            - Mantém o **Valor Base** do mês.
+            - Se a moeda for USD, converte para BRL com USD/BRL atual.
+        """)
+
+        st.subheader("📈 Variação % do dia (Posição Atual)")
+        st.markdown("""
+        A variação do dia é priorizada da seguinte forma:
+        1. Se o yfinance fornece `regularMarketChangePercent`, usa esse valor.
+        2. Senão, calcula usando `Preço Atual` e `Preço Anterior`:
+             $$Varia\u00e7\u00e3o\% = (PreçoAtual / PreçoAnterior - 1) \times 100$$
+
+        Observação: isso representa a variação **do dia (D-1 → D)**, não a variação vs preço histórico mensal.
+        """)
+
+        st.subheader("🏆 Maiores Altas/Baixas (Top 10)")
+        st.markdown("""
+        O painel Top 10 usa os ativos com posição e ordena pela variação do dia.
+
+        - Quando possível, também estima o **Ganho/Perda no dia (R$)** a partir do % e do valor atual da posição.
+            Ideia: se um ativo subiu $p\%$ e o valor atual é $V$, então o valor base aproximado é $V/(1+p)$,
+            e o ganho aproximado é $V - V/(1+p)$.
+        """)
+
+        st.subheader("📊 Distribuição")
+        st.markdown("""
+        Gráficos de distribuição somam valores por dimensões (Tipo/Setor/Ativo etc.) e exibem pizza/barras.
+        A base normalmente é a coluna **Valor** (que no painel de Posição Atual vem de `Valor Atualizado`).
+        """)
+
+        st.subheader("📈 Gráficos de Proventos (média móvel)")
+        st.markdown("""
+        No gráfico de barras de proventos, existe uma opção de **média móvel** (3/6/9/12 meses).
+        A média móvel é calculada com `rolling(window, min_periods=1, center=False)` para:
+        - Começar desde o início (sem buracos)
+        - Ir até a última barra (sem encerrar antes)
+        """)
+
+# ==========================================
+# SEÇÃO: CACHE E PERSISTÊNCIA
+# ==========================================
+elif indice_selecionado == "🗄️ Cache e Persistência":
+        st.header("🗄️ Cache e Persistência")
+
+        st.markdown("""
+        O projeto usa duas camadas de “cache”:
+        - **Memória (Streamlit)**: `st.cache_data` e `st.session_state`
+        - **Disco (Parquet/arquivos)**: dados persistidos em `data/` e relatórios em `Relatorios/`
+        """)
+
+        st.subheader("🧠 Cache em memória (Streamlit)")
+        st.markdown("""
+        - `st.session_state`: guarda dataframes e sinais de atualização para evitar recomputar em toda interação.
+        - `st.cache_data`: cacheia funções puras/sem estado (ex.: leitura de parquet, requests) para performance.
+
+        Importante: o botão **Atualizar cotações** chama `st.cache_data.clear()`.
+        Isso garante que funções cacheadas não devolvam resultados antigos quando o usuário deseja atualizar.
+        """)
+
+        st.subheader("💾 Persistência em disco")
+        st.markdown("""
+        - Dados consolidados e caches de apoio são gravados em `data/` (principalmente `.parquet`).
+        - PDFs e relatórios importados podem ficar em `uploads/` e `Relatorios/` (dependendo do fluxo).
+
+        Boa prática: sempre que mudar a estrutura de colunas, validar se os parquets antigos ainda são compatíveis.
+        """)
 
 # ==========================================
 # SEÇÃO 2: ARQUITETURA E ESTRUTURA
@@ -159,32 +309,34 @@ elif indice_selecionado == "🏗️ Arquitetura e Estrutura":
     st.code("""
 invest/
 │
-├── README.md                      # Documentação geral
+├── APP.py                         # Aplicação Streamlit principal (entrada)
 ├── requirements.txt               # Dependências do projeto
-├── APP.py                         # Entrada principal (legado)
+├── README.md                      # Documentação geral
+├── LEIA_PRIMEIRO.txt              # Guia (PDFs Avenue e documentação associada)
 │
-├── src/
-│   ├── __init__.py               # Marca como pacote
-│   ├── app.py                    # Aplicação Streamlit principal
-│   │
-│   ├── modules/
-│   │   ├── __init__.py           # Marca como pacote
-│   │   ├── data_processing.py    # Processamento de dados
-│   │   ├── market_data.py        # Dados de mercado e benchmarks
-│   │   ├── manual_input.py       # Entrada manual de investimentos
-│   │   ├── alerts.py             # Sistema de alertas e projeções
-│   │   └── upload.py             # Importação de CSV
-│   │
-│   └── pages/                    # Páginas Streamlit multi-page
-│       ├── 1_📊_Dashboard.py
-│       ├── 2_📈_Gráficos.py
-│       ├── 6_📚_Documentacao.py
-│       └── ...
+├── pages/                         # Páginas Streamlit (multi-page)
+│   ├── Upload_Relatorio.py
+│   ├── Indicadores_Mercado.py
+│   ├── Debug_Excel.py
+│   └── Sobre_o_Projeto.py          # Esta página (documentação)
 │
-├── data/                         # Arquivos CSV de dados
-├── assets/                       # Imagens e ícones
+├── modules/                       # Backend principal (processamento, upload, cotações)
+│   ├── upload_relatorio.py         # Upload/consolidação de relatórios Excel
+│   ├── upload_pdf_avenue_*.py      # Parsers de PDFs Avenue
+│   ├── cotacoes.py                 # USD/BRL e utilitários de câmbio
+│   ├── posicao_atual.py            # Atualização em tempo real (yfinance) + cálculos
+│   ├── ticker_info.py              # Cache local de informações de tickers (parquet)
+│   ├── usuarios.py                 # Gestão de usuários
+│   └── ...
 │
-└── .venv/                        # Ambiente virtual Python
+├── data/                          # Persistência/cache local (parquet/json/uploads)
+│   ├── uploads/
+│   └── rentabilidade_base_meta.json
+│
+├── Relatorios/                    # Relatórios organizados por usuário/fonte
+├── uploads/                       # PDFs temporários (ex.: uploads/pdf_avenue)
+├── assets/                        # Recursos estáticos
+└── src/                           # Código auxiliar/legado (espelho e módulos antigos)
     """, language="text")
     
     st.markdown("---")

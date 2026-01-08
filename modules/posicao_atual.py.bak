@@ -202,61 +202,59 @@ def preparar_posicao_base(df_cons: pd.DataFrame, agrupar_por_usuario: bool = Fal
     return df_out
 
 
-def _buscar_preco_yfinance(ticker: str) -> Tuple[Optional[float], Optional[str], Optional[float], Optional[float]]:
-    """Retorna (preco_atual, ticker_yf, preco_anterior, variacao_pct)."""
+def _buscar_preco_yfinance(ticker: str) -> Tuple[Optional[float], Optional[str]]:
+    """Retorna (preco, ticker_usado_no_yf) com melhor esforço para preço mais recente."""
     t0 = (ticker or "").strip().upper()
     if not t0:
-        return None, None, None, None
+        return None, None
 
     sym = ticker_para_yfinance(t0) or t0
 
     try:
         tk = yf.Ticker(sym)
-        preco_atual = None
-        preco_anterior = None
-        variacao_pct = None
 
-        # Tentar obter info completo (tem variação % e previousClose)
+        # 1) fast_info costuma trazer último preço intraday quando disponível
+        try:
+            fi = getattr(tk, "fast_info", None)
+            if fi and isinstance(fi, dict):
+                px_last = fi.get("last_price")
+                if px_last is not None and float(px_last) > 0:
+                    return float(px_last), sym
+        except Exception:
+            pass
+
+        # 2) Histórico intraday (1m) para capturar preço recente
+        try:
+            hist = tk.history(period="1d", interval="1m")
+            if isinstance(hist, pd.DataFrame) and (not hist.empty) and ("Close" in hist.columns):
+                px_last = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+                if not px_last.empty:
+                    return float(px_last.iloc[-1]), sym
+        except Exception:
+            pass
+
+        # 3) Histórico diário (close do dia)
+        try:
+            hist_d = tk.history(period="5d")
+            if isinstance(hist_d, pd.DataFrame) and (not hist_d.empty) and ("Close" in hist_d.columns):
+                px_last = pd.to_numeric(hist_d["Close"], errors="coerce").dropna()
+                if not px_last.empty:
+                    return float(px_last.iloc[-1]), sym
+        except Exception:
+            pass
+
+        # 4) regularMarketPrice como último recurso
         try:
             info = tk.info or {}
-            preco_atual = info.get("regularMarketPrice") or info.get("currentPrice")
-            preco_anterior = info.get("previousClose") or info.get("regularMarketPreviousClose")
-            variacao_pct = info.get("regularMarketChangePercent")
-            
-            if preco_atual is not None and float(preco_atual) > 0:
-                return float(preco_atual), sym, float(preco_anterior) if preco_anterior else None, float(variacao_pct) if variacao_pct else None
+            px_last = info.get("regularMarketPrice")
+            if px_last is not None and float(px_last) > 0:
+                return float(px_last), sym
         except Exception:
             pass
 
-        # Fallback: histórico de 5 dias para calcular variação
-        try:
-            hist = tk.history(period="5d")
-            if isinstance(hist, pd.DataFrame) and (not hist.empty) and ("Close" in hist.columns):
-                closes = pd.to_numeric(hist["Close"], errors="coerce").dropna()
-                if len(closes) >= 2:
-                    preco_atual = float(closes.iloc[-1])
-                    preco_anterior = float(closes.iloc[-2])
-                    variacao_pct = ((preco_atual / preco_anterior) - 1.0) * 100.0
-                    return preco_atual, sym, preco_anterior, variacao_pct
-                elif len(closes) == 1:
-                    preco_atual = float(closes.iloc[-1])
-                    return preco_atual, sym, None, None
-        except Exception:
-            pass
-
-        # Histórico intraday como último recurso
-        try:
-            hist_intra = tk.history(period="1d", interval="1m")
-            if isinstance(hist_intra, pd.DataFrame) and (not hist_intra.empty) and ("Close" in hist_intra.columns):
-                px_last = pd.to_numeric(hist_intra["Close"], errors="coerce").dropna()
-                if not px_last.empty:
-                    return float(px_last.iloc[-1]), sym, None, None
-        except Exception:
-            pass
-
-        return None, sym, None, None
+        return None, sym
     except Exception:
-        return None, sym, None, None
+        return None, sym
 
 
 def atualizar_cotacoes(df_posicao: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], datetime]:
@@ -305,8 +303,6 @@ def atualizar_cotacoes(df_posicao: pd.DataFrame) -> Tuple[pd.DataFrame, List[str
     sem_cotacao: List[str] = []
     cotacoes_fx: List[Optional[float]] = []
     preco_hist_brl: List[Optional[float]] = []
-    precos_anteriores: List[Optional[float]] = []
-    variacoes_pct: List[Optional[float]] = []
 
     for _, row in df.iterrows():
         tk = str(row.get("Ticker") or "").strip().upper()
@@ -320,8 +316,6 @@ def atualizar_cotacoes(df_posicao: pd.DataFrame) -> Tuple[pd.DataFrame, List[str
             sym = None
             tickers_yf.append(sym)
             fontes.append("Base (mês)")
-            precos_anteriores.append(np.nan)
-            variacoes_pct.append(np.nan)
 
             if moeda == "USD":
                 cotacoes_fx.append(float(cotacao_usd_brl))
@@ -340,7 +334,7 @@ def atualizar_cotacoes(df_posicao: pd.DataFrame) -> Tuple[pd.DataFrame, List[str
 
             continue
 
-        preco_yf, sym, preco_ant_yf, var_pct_yf = _buscar_preco_yfinance(tk)
+        preco_yf, sym = _buscar_preco_yfinance(tk)
 
         preco_base = None
         fonte = None
@@ -356,10 +350,6 @@ def atualizar_cotacoes(df_posicao: pd.DataFrame) -> Tuple[pd.DataFrame, List[str
         else:
             preco_base = float(preco_yf)
             fonte = "yfinance"
-
-        # Salvar preço anterior e variação % do yfinance
-        precos_anteriores.append(preco_ant_yf if preco_ant_yf is not None else np.nan)
-        variacoes_pct.append(var_pct_yf if var_pct_yf is not None else np.nan)
 
         if moeda == "USD":
             cotacoes_fx.append(float(cotacao_usd_brl))
@@ -382,8 +372,6 @@ def atualizar_cotacoes(df_posicao: pd.DataFrame) -> Tuple[pd.DataFrame, List[str
     df["Preço Atual"] = pd.to_numeric(precos_brl, errors="coerce")
     df["Preço Atual (USD)"] = pd.to_numeric(precos_usd, errors="coerce")
     df["Cotação USD/BRL"] = pd.to_numeric(cotacoes_fx, errors="coerce")
-    df["Preço Anterior"] = pd.to_numeric(precos_anteriores, errors="coerce")
-    df["Variação % YF"] = pd.to_numeric(variacoes_pct, errors="coerce")
     df["Fonte Preço"] = fontes
     df["Preço Histórico"] = pd.to_numeric(df["Preço"], errors="coerce")
     df["Preço Histórico (BRL)"] = pd.to_numeric(preco_hist_brl, errors="coerce")
@@ -412,15 +400,13 @@ def atualizar_cotacoes(df_posicao: pd.DataFrame) -> Tuple[pd.DataFrame, List[str
         valor_base_brl,
     )
 
-    # Variação %: Usar variação do yfinance quando disponível, senão calcular com preço anterior
     df["Variação %"] = np.where(
-        df["Variação % YF"].notna(),
-        df["Variação % YF"],
-        np.where(
-            mask_atualiza & df["Preço Anterior"].notna() & (df["Preço Anterior"] > 0) & df["Preço Atual"].notna(),
-            (df["Preço Atual"] / df["Preço Anterior"] - 1.0) * 100.0,
-            np.nan
-        )
+        mask_atualiza
+        & df["Preço Histórico (BRL)"].notna()
+        & (df["Preço Histórico (BRL)"] > 0)
+        & df["Preço Atual"].notna(),
+        (df["Preço Atual"] / df["Preço Histórico (BRL)"] - 1.0) * 100.0,
+        np.nan,
     )
 
     atualizado_em = datetime.now()
