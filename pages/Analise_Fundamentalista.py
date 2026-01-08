@@ -575,71 +575,120 @@ def _build_indicators_periodic(
         elif periodicidade == "Anual" and "EPS" in out.columns:
             out["P/L"] = np.where(out["EPS"].notna() & (out["EPS"] > 0) & out["Preço"].notna(), out["Preço"] / out["EPS"], np.nan)
 
-    # Projeção (apenas Mensal/Anual): último trimestral + preço atual
+    # Complemento no modo Anual (anos sem relatório anual):
+    # usa o último trimestre realizado e recalcula com preço do fechamento do ano (ou cotação atual no ano corrente).
     try:
-        if periodicidade in ["Anual"]:
-            proj_dt = _year_end_for_current_year()
-        else:
-            proj_dt = None
+        if periodicidade == "Anual":
+            now = pd.Timestamp.now()
+            current_year = int(now.year)
 
-        col_last = _pick_price_column(price_df) if isinstance(price_df, pd.DataFrame) else None
-        last_px = (
-            pd.to_numeric(price_df[col_last], errors="coerce").dropna().iloc[-1]
-            if isinstance(price_df, pd.DataFrame) and (not price_df.empty) and col_last and col_last in price_df.columns
-            else None
-        )
+            # Base trimestral (fonte para anos sem anual)
+            q_src = q_metrics.copy() if isinstance(q_metrics, pd.DataFrame) else pd.DataFrame()
+            if not q_src.empty:
+                q_src["Data"] = pd.to_datetime(q_src.get("Data"), errors="coerce")
+                if pd.api.types.is_datetime64tz_dtype(q_src["Data"]):
+                    q_src["Data"] = q_src["Data"].dt.tz_localize(None)
+                q_src = q_src.dropna(subset=["Data"]).sort_values("Data")
 
-        # Base trimestral para projeção (fallback: último anual)
-        q_src = q_metrics.copy() if isinstance(q_metrics, pd.DataFrame) else pd.DataFrame()
-        if not q_src.empty:
-            q_src["Data"] = pd.to_datetime(q_src.get("Data"), errors="coerce")
-            if pd.api.types.is_datetime64tz_dtype(q_src["Data"]):
-                q_src["Data"] = q_src["Data"].dt.tz_localize(None)
-            q_src = q_src.dropna(subset=["Data"]).sort_values("Data")
+            # Preços para lookup
+            p_src = price_df.copy() if isinstance(price_df, pd.DataFrame) else pd.DataFrame()
+            col_last = _pick_price_column(p_src) if isinstance(p_src, pd.DataFrame) else None
+            if isinstance(p_src, pd.DataFrame) and (not p_src.empty) and ("Data" in p_src.columns) and col_last and col_last in p_src.columns:
+                p_src["Data"] = pd.to_datetime(p_src.get("Data"), errors="coerce")
+                if pd.api.types.is_datetime64tz_dtype(p_src["Data"]):
+                    p_src["Data"] = p_src["Data"].dt.tz_localize(None)
+                p_src[col_last] = pd.to_numeric(p_src[col_last], errors="coerce")
+                p_src = p_src.dropna(subset=["Data", col_last]).sort_values("Data")
+            else:
+                p_src = pd.DataFrame()
 
-        if (
-            periodicidade == "Anual"
-            and proj_dt is not None
-            and isinstance(last_px, (int, float, np.number))
-            and np.isfinite(float(last_px))
-        ):
-            # Só adiciona se não tiver ponto nesse ano ainda
-            if out.index.max() is None or pd.Timestamp(out.index.max()) < proj_dt:
+            def _price_asof(dt: pd.Timestamp) -> float | None:
+                if p_src.empty or not col_last:
+                    return None
+                dt = pd.to_datetime(dt, errors="coerce")
+                if pd.isna(dt):
+                    return None
+                hit = p_src[p_src["Data"] <= dt]
+                if hit.empty:
+                    return None
+                v = hit.iloc[-1][col_last]
+                return float(v) if pd.notna(v) else None
+
+            def _div_yield_12m_at(dt: pd.Timestamp, px: float) -> float | None:
+                if not isinstance(px, (int, float, np.number)) or not np.isfinite(float(px)) or float(px) <= 0:
+                    return None
+                if not (isinstance(dividends_df, pd.DataFrame) and not dividends_df.empty):
+                    return None
+                d = dividends_df.copy()
+                d["Data"] = pd.to_datetime(d.get("Data"), errors="coerce")
+                if pd.api.types.is_datetime64tz_dtype(d["Data"]):
+                    d["Data"] = d["Data"].dt.tz_localize(None)
+                d["Dividendo"] = pd.to_numeric(d.get("Dividendo"), errors="coerce")
+                d = d.dropna(subset=["Data", "Dividendo"]).sort_values("Data")
+                if d.empty:
+                    return None
+                cutoff = pd.Timestamp(dt).normalize() - pd.DateOffset(months=12)
+                div_12m = float(d.loc[(d["Data"] > cutoff) & (d["Data"] <= dt), "Dividendo"].sum())
+                return (div_12m / float(px)) if float(px) > 0 else None
+
+            # De onde começa a série anual
+            start_year = None
+            if out.index is not None and len(out.index) > 0:
+                try:
+                    start_year = int(pd.Timestamp(out.index.min()).year)
+                except Exception:
+                    start_year = None
+            if start_year is None and not q_src.empty:
+                try:
+                    start_year = int(pd.to_datetime(q_src["Data"], errors="coerce").dropna().min().year)
+                except Exception:
+                    start_year = None
+            if start_year is None:
+                start_year = current_year
+
+            years_with_annual = {int(pd.Timestamp(ix).year) for ix in out.index}
+            for y in range(start_year, current_year + 1):
+                # Regra: anual sempre tem prioridade no modo anual
+                if y in years_with_annual:
+                    continue
+
+                year_end = pd.Timestamp(year=y, month=12, day=31)
+                cutoff_dt = year_end if y < current_year else now
+
+                # Fonte: último trimestre até o cutoff
+                src = {}
                 if not q_src.empty:
-                    src = q_src.iloc[-1].to_dict()
-                else:
-                    # fallback: último ponto anual existente
-                    src = out.iloc[-1].to_dict() if not out.empty else {}
+                    hit_q = q_src[q_src["Data"] <= cutoff_dt]
+                    if not hit_q.empty:
+                        src = hit_q.iloc[-1].to_dict()
 
-                # Projeção só para métricas dependentes de preço (não distorce Receita/EBITDA etc)
+                # Preço: fechamento do ano (ano passado) ou último fechamento (ano atual)
+                px = _price_asof(year_end) if y < current_year else _price_asof(now)
+                if px is None:
+                    continue
+
+                proj_dt = pd.Timestamp(year=y, month=12, day=31, hour=12)
                 proj = {c: np.nan for c in out.columns}
-                proj["Preço"] = float(last_px)
+                proj["Preço"] = float(px)
+
                 for k in ["BVPS", "EPS TTM", "EPS"]:
                     if k in out.columns and k in src:
                         proj[k] = src.get(k)
 
-                # Recalcular DV 12m com preço atual (dividendos dos últimos 12 meses)
-                if isinstance(dividends_df, pd.DataFrame) and not dividends_df.empty:
-                    d = dividends_df.copy()
-                    d["Data"] = pd.to_datetime(d.get("Data"), errors="coerce")
-                    if pd.api.types.is_datetime64tz_dtype(d["Data"]):
-                        d["Data"] = d["Data"].dt.tz_localize(None)
-                    d["Dividendo"] = pd.to_numeric(d.get("Dividendo"), errors="coerce")
-                    d = d.dropna(subset=["Data", "Dividendo"]).sort_values("Data")
-                    cutoff = pd.Timestamp.now().normalize() - pd.DateOffset(months=12)
-                    div_12m = float(d.loc[d["Data"] >= cutoff, "Dividendo"].sum()) if not d.empty else 0.0
-                    proj["Dividend Yield"] = (div_12m / float(last_px)) if float(last_px) > 0 else np.nan
+                dy = _div_yield_12m_at(year_end if y < current_year else now, float(px))
+                if dy is not None:
+                    proj["Dividend Yield"] = dy
 
                 bvps = _as_float(src.get("BVPS"))
                 if bvps and bvps > 0:
-                    proj["P/VP"] = float(last_px) / bvps
+                    proj["P/VP"] = float(px) / bvps
 
                 eps_ttm = _as_float(src.get("EPS TTM"))
                 eps = _as_float(src.get("EPS"))
                 if eps_ttm and eps_ttm > 0:
-                    proj["P/L"] = float(last_px) / eps_ttm
+                    proj["P/L"] = float(px) / eps_ttm
                 elif eps and eps > 0:
-                    proj["P/L"] = float(last_px) / eps
+                    proj["P/L"] = float(px) / eps
 
                 out.loc[proj_dt] = pd.Series(proj)
     except Exception:
@@ -1297,38 +1346,58 @@ with st.expander("🧾 Indicadores (melhor esforço via yfinance)", expanded=Tru
                 )
                 x_min = pd.to_datetime(df_plot["Data"], errors="coerce").min()
                 x_max = pd.to_datetime(df_plot["Data"], errors="coerce").max()
-                if periodicidade == "Anual" and pd.notna(x_min) and pd.notna(x_max):
-                    # Evita a sensação de que 31/12 cai no ano seguinte e evita tick extra (ex.: 2027).
-                    tick0 = pd.Timestamp(year=int(x_min.year), month=12, day=31, hour=12)
-                    fig.update_xaxes(
-                        type="date",
-                        tickformat="%Y",
-                        dtick="M12",
-                        tick0=tick0,
-                        range=[x_min, x_max],
-                        rangemode="normal",
-                    )
+                if pd.notna(x_min) and pd.notna(x_max):
+                    # Para evitar a percepção de que 31/12 cai no ano seguinte (tick em 01/01),
+                    # ancoramos os ticks anuais em 31/12 também no Mensal/Trimestral.
+                    if periodicidade in ["Anual", "Trimestral", "Mensal"]:
+                        tick0 = pd.Timestamp(year=int(x_min.year), month=12, day=31, hour=12)
+                        pad = pd.Timedelta(days=45) if periodicidade == "Anual" else pd.Timedelta(days=20)
+                        fig.update_xaxes(
+                            type="date",
+                            tickformat="%Y",
+                            dtick="M12",
+                            tick0=tick0,
+                            range=[x_min - pad, x_max + pad],
+                            rangemode="normal",
+                        )
+                    else:
+                        fig.update_xaxes(type="date")
                 else:
                     fig.update_xaxes(type="date")
-                fig.update_traces(
-                    mode="lines+markers",
-                    hovertemplate="%{x|%d/%m/%Y}<br>%{y:.2f}<extra></extra>",
-                )
 
-                last = df_plot.iloc[-1]
-                fig.add_trace(
-                    go.Scatter(
-                        x=[last["Data"]],
-                        y=[last[col]],
-                        mode="markers+text",
-                        text=[f"{float(last[col]):.2f}"],
+                if periodicidade == "Anual":
+                    # Rótulos de dados em todos os pontos no anual
+                    fig.update_traces(
+                        mode="lines+markers+text",
+                        text=[f"{float(v):.2f}" for v in df_plot[col].tolist()],
                         textposition="top center",
-                        textfont_size=8,
-                        marker=dict(size=6),
-                        showlegend=False,
-                        hoverinfo="skip",
+                        textfont_size=9,
+                        hovertemplate="%{x|%d/%m/%Y}<br>%{y:.2f}<extra></extra>",
+                        cliponaxis=False,
                     )
-                )
+                else:
+                    fig.update_traces(
+                        mode="lines+markers",
+                        hovertemplate="%{x|%d/%m/%Y}<br>%{y:.2f}<extra></extra>",
+                    )
+
+                # Nos demais modos, mantém rótulo só no último ponto (evita poluição)
+                if periodicidade != "Anual":
+                    last = df_plot.iloc[-1]
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[last["Data"]],
+                            y=[last[col]],
+                            mode="markers+text",
+                            text=[f"{float(last[col]):.2f}"],
+                            textposition="top center",
+                            textfont_size=8,
+                            marker=dict(size=6),
+                            showlegend=False,
+                            hoverinfo="skip",
+                            cliponaxis=False,
+                        )
+                    )
 
                 fig.update_layout(margin=dict(t=60))
                 st.plotly_chart(fig, use_container_width=True)
