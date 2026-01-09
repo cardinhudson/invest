@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
+import yfinance as yf
 from modules.ticker_info import CACHE_PATH as TICKER_INFO_PATH
 
 from modules.usuarios import carregar_usuarios, salvar_usuarios
@@ -17,6 +18,11 @@ from modules.posicao_atual import preparar_posicao_base, atualizar_cotacoes, dat
 from modules.investimentos_manuais import (
     carregar_caixa,
     registrar_caixa,
+    carregar_caixa_movimentos,
+    registrar_caixa_movimentos,
+    CAIXA_PATH,
+    CAIXA_MOVS_PATH,
+    ACOES_MANUAIS_PATH,
     carregar_acoes as carregar_acoes_man,
     registrar_acao_manual,
     caixa_para_dividendos,
@@ -122,6 +128,64 @@ def carregar_df_parquet(path):
             return pd.DataFrame()
     else:
         return pd.DataFrame()
+
+
+def _normalizar_df_caixa(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if "Mes" in out.columns and "Mês" not in out.columns:
+        out = out.rename(columns={"Mes": "Mês"})
+    if "Rentabilidade %" in out.columns and "Rentabilidade (%)" not in out.columns:
+        out = out.rename(columns={"Rentabilidade %": "Rentabilidade (%)"})
+    if "Nome Caixa" not in out.columns:
+        out["Nome Caixa"] = "Caixa Principal"
+    if "Usuário" not in out.columns:
+        out["Usuário"] = "Manual"
+    if "ID" not in out.columns:
+        import uuid
+
+        out["ID"] = [str(uuid.uuid4()) for _ in range(len(out))]
+    if "Fechado" not in out.columns:
+        out["Fechado"] = True
+    for col in ["Valor Inicial", "Depósitos", "Saques", "Valor Final", "Rentabilidade (%)", "Ganho"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def _normalizar_df_caixa_movs(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if "Mes" in out.columns and "Mês" not in out.columns:
+        out = out.rename(columns={"Mes": "Mês"})
+    if "Nome Caixa" not in out.columns:
+        out["Nome Caixa"] = "Caixa Principal"
+    if "Usuário" not in out.columns:
+        out["Usuário"] = "Manual"
+    if "ID" not in out.columns:
+        import uuid
+
+        out["ID"] = [str(uuid.uuid4()) for _ in range(len(out))]
+    if "Valor" in out.columns:
+        out["Valor"] = pd.to_numeric(out["Valor"], errors="coerce")
+    if "Data" in out.columns:
+        out["Data"] = pd.to_datetime(out["Data"], errors="coerce")
+    if "Tipo" in out.columns:
+        out["Tipo"] = out["Tipo"].astype(str)
+    return out
+
+
+def carregar_caixa_fast() -> pd.DataFrame:
+    # Usa cache por mtime (carregar_df_parquet já é cacheado via _read_parquet_cached)
+    df = carregar_df_parquet(CAIXA_PATH)
+    return _normalizar_df_caixa(df)
+
+
+def carregar_caixa_movimentos_fast() -> pd.DataFrame:
+    df = carregar_df_parquet(CAIXA_MOVS_PATH)
+    return _normalizar_df_caixa_movs(df)
 
 def aplicar_filtros_padrao(df, chave_prefixo="filtro"):
     """Aplica filtros padrão: Mês/Ano, Usuário, Tipo"""
@@ -661,6 +725,448 @@ df_dividendos_avenue = padronizar_dividendos_avenue(df_dividendos_avenue_raw) if
 df_manual_caixa = carregar_caixa()
 df_manual_acoes = carregar_acoes_man()
 df_dividendos_caixa = caixa_para_dividendos(df_manual_caixa)
+
+
+def _parse_mes_ano_to_period_global(mes_ano) -> pd.Period | None:
+    if pd.isna(mes_ano):
+        return None
+    txt = str(mes_ano).strip()
+    if not txt:
+        return None
+    try:
+        mm, yyyy = txt.split("/")
+        return pd.Period(f"{int(yyyy):04d}-{int(mm):02d}", freq="M")
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def _yf_close_mensal(sym: str) -> pd.Series:
+    sym = (sym or "").strip()
+    if not sym:
+        return pd.Series(dtype=float)
+    try:
+        hist = yf.Ticker(sym).history(period="max", interval="1d", auto_adjust=False)
+        if not isinstance(hist, pd.DataFrame) or hist.empty or "Close" not in hist.columns:
+            return pd.Series(dtype=float)
+        s = pd.to_numeric(hist["Close"], errors="coerce")
+        s.index = pd.to_datetime(s.index, errors="coerce")
+        s = s[~s.index.isna()].copy()
+        if s.empty:
+            return pd.Series(dtype=float)
+        s_m = s.resample("M").last().dropna()
+        s_m.index = s_m.index.to_period("M")
+        return s_m
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def _fx_mensal(moeda: str) -> pd.Series:
+    m = (moeda or "").strip().upper()
+    if not m or m == "BRL":
+        return pd.Series(dtype=float)
+    idx = None
+    if m == "USD":
+        idx = "USD/BRL"
+    elif m == "EUR":
+        idx = "EUR/BRL"
+    if not idx:
+        return pd.Series(dtype=float)
+    try:
+        hist = obter_historico_indice(idx, periodo="max", intervalo="1d")
+        if hist is None or hist.empty:
+            return pd.Series(dtype=float)
+        h = hist.copy()
+        # Alguns retornos vêm com coluna 'Date' ao invés de índice de datas
+        if "Date" in h.columns:
+            h["Date"] = pd.to_datetime(h["Date"], errors="coerce")
+            h = h[h["Date"].notna()].copy()
+            h = h.set_index("Date")
+
+        close = pd.to_numeric(h.get("Close"), errors="coerce")
+        close.index = pd.to_datetime(close.index, errors="coerce")
+        # Remove timezone se existir
+        try:
+            if hasattr(close.index, "tz") and close.index.tz is not None:
+                close.index = close.index.tz_localize(None)
+        except Exception:
+            pass
+
+        close = close[~close.index.isna()].copy()
+        close_m = close.resample("M").last().dropna()
+        close_m.index = close_m.index.to_period("M")
+        return close_m
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _ler_json_safe(path: str) -> dict:
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+                return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+    return {}
+
+
+def _salvar_json_safe(path: str, obj: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj or {}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _mtime_or_none(path: str):
+    try:
+        return os.path.getmtime(path) if path and os.path.exists(path) else None
+    except Exception:
+        return None
+
+
+def _load_or_build_parquet_cached(
+    parquet_path: str,
+    meta_path: str,
+    meta_new: dict,
+    build_fn,
+) -> pd.DataFrame:
+    meta_old = _ler_json_safe(meta_path)
+    if meta_old == meta_new and os.path.exists(parquet_path):
+        return carregar_df_parquet(parquet_path)
+    df = build_fn()
+    try:
+        os.makedirs(os.path.dirname(parquet_path) or ".", exist_ok=True)
+        if isinstance(df, pd.DataFrame):
+            df.to_parquet(parquet_path, index=False)
+        _salvar_json_safe(meta_path, meta_new)
+    except Exception:
+        pass
+    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+
+def _preco_compra_overrides(df_lotes: pd.DataFrame) -> pd.DataFrame:
+    """Retorna preços de compra para usar no mês da compra (média ponderada por quantidade).
+
+    Saída: colunas [Ticker_YF, Moeda, Periodo, Preço Compra]
+    """
+    if df_lotes is None or df_lotes.empty:
+        return pd.DataFrame(columns=["Ticker_YF", "Moeda", "Periodo", "Preço Compra"])
+
+    df = df_lotes.copy()
+    if "Preço Compra" not in df.columns:
+        return pd.DataFrame(columns=["Ticker_YF", "Moeda", "Periodo", "Preço Compra"])
+
+    if "Mês Compra" not in df.columns and "Mês/Ano" in df.columns:
+        df["Mês Compra"] = df["Mês/Ano"].astype(str)
+    if "Quantidade Compra" not in df.columns and "Quantidade" in df.columns:
+        df["Quantidade Compra"] = pd.to_numeric(df["Quantidade"], errors="coerce")
+
+    df["Preço Compra"] = pd.to_numeric(df.get("Preço Compra"), errors="coerce").fillna(0.0)
+    df["Quantidade Compra"] = pd.to_numeric(df.get("Quantidade Compra"), errors="coerce").fillna(0.0)
+    df["Ticker_YF"] = df.get("Ticker_YF", "").astype(str).str.strip()
+    df["Moeda"] = df.get("Moeda", "BRL").fillna("BRL").astype(str).str.strip().str.upper()
+
+    p_compra = df["Mês Compra"].apply(_parse_mes_ano_to_period_global)
+    df = df[p_compra.notna()].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["Ticker_YF", "Moeda", "Periodo", "Preço Compra"])
+    df["Periodo"] = p_compra[p_compra.notna()].astype("period[M]")
+
+    df = df[(df["Preço Compra"] > 0) & (df["Quantidade Compra"] > 0) & (df["Ticker_YF"].astype(str).str.len() > 0)].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["Ticker_YF", "Moeda", "Periodo", "Preço Compra"])
+
+    df["_WSum"] = df["Preço Compra"] * df["Quantidade Compra"]
+    grp = (
+        df.groupby(["Ticker_YF", "Moeda", "Periodo"], as_index=False)
+        .agg(Qty=("Quantidade Compra", "sum"), WSum=("_WSum", "sum"))
+    )
+    grp["Preço Compra"] = np.where(grp["Qty"] > 0, grp["WSum"] / grp["Qty"], np.nan)
+    out = grp[["Ticker_YF", "Moeda", "Periodo", "Preço Compra"]].copy()
+    out["Preço Compra"] = pd.to_numeric(out["Preço Compra"], errors="coerce")
+    out = out.dropna(subset=["Preço Compra"]).copy()
+    return out
+
+
+def acoes_manuais_para_consolidado_mensal(df_acoes_lotes: pd.DataFrame) -> pd.DataFrame:
+    if df_acoes_lotes is None or df_acoes_lotes.empty:
+        return pd.DataFrame()
+
+    df = df_acoes_lotes.copy()
+    if "Usuário" not in df.columns:
+        df["Usuário"] = "Manual"
+    df["Usuário"] = df["Usuário"].fillna("Manual").astype(str)
+
+    # Campos do schema novo (lotes)
+    if "Mês Compra" not in df.columns and "Mês/Ano" in df.columns:
+        df["Mês Compra"] = df["Mês/Ano"].astype(str)
+    if "Quantidade Compra" not in df.columns and "Quantidade" in df.columns:
+        df["Quantidade Compra"] = pd.to_numeric(df["Quantidade"], errors="coerce")
+    if "Mês Venda" not in df.columns:
+        df["Mês Venda"] = ""
+    if "Quantidade Venda" not in df.columns:
+        df["Quantidade Venda"] = 0.0
+
+    df["Quantidade Compra"] = pd.to_numeric(df.get("Quantidade Compra"), errors="coerce").fillna(0.0)
+    df["Quantidade Venda"] = pd.to_numeric(df.get("Quantidade Venda"), errors="coerce").fillna(0.0)
+
+    # Normalizar ticker/símbolo/moeda
+    df["Ticker"] = df.get("Ticker", "").astype(str).str.strip().str.upper()
+    df["Ticker_YF"] = df.get("Ticker_YF", "").astype(str).str.strip()
+    df["Moeda"] = df.get("Moeda", "BRL").fillna("BRL").astype(str).str.strip().str.upper()
+
+    from modules.historico_acoes_manuais import expand_lotes_para_posicao_mensal
+
+    pos = expand_lotes_para_posicao_mensal(df)
+    if pos.empty:
+        return pd.DataFrame()
+
+    overrides = _preco_compra_overrides(df)
+
+    # Preço mensal + FX mensal (converte para BRL, igual o consolidado de Ações Dólar do app)
+    precos = []
+    for sym, moeda in pos[["Ticker_YF", "Moeda"]].drop_duplicates().itertuples(index=False):
+        sym2 = (sym or "").strip()
+        if not sym2:
+            continue
+        close = _yf_close_mensal(sym2)
+        if close.empty:
+            continue
+        fx = _fx_mensal(moeda)
+        if moeda == "BRL" or fx.empty:
+            preco_brl = close
+        else:
+            fx_alinhado = fx.reindex(close.index).ffill().bfill()
+            fx_alinhado = pd.to_numeric(fx_alinhado, errors="coerce").fillna(1.0)
+            preco_brl = close.mul(fx_alinhado)
+        dfp = pd.DataFrame({
+            "Ticker_YF": sym2,
+            "Moeda": moeda,
+            "Periodo": preco_brl.index,
+            "Preço": pd.to_numeric(preco_brl.values, errors="coerce"),
+        })
+        precos.append(dfp)
+
+    df_preco = pd.concat(precos, ignore_index=True) if precos else pd.DataFrame(columns=["Ticker_YF", "Moeda", "Periodo", "Preço"])
+
+    # Aplica override no mês da compra (convertendo para BRL se necessário)
+    if not overrides.empty:
+        ov = overrides.copy()
+        ov["Preço"] = pd.to_numeric(ov["Preço Compra"], errors="coerce")
+        ov["FX"] = 1.0
+        for m in ov["Moeda"].dropna().unique().tolist():
+            m2 = (m or "").upper()
+            if m2 == "BRL":
+                continue
+            fxm = _fx_mensal(m2)
+            if fxm.empty:
+                continue
+            fx_map = fxm.to_dict()
+            mask = ov["Moeda"].astype(str).str.upper() == m2
+            ov.loc[mask, "FX"] = ov.loc[mask, "Periodo"].map(fx_map)
+        ov["FX"] = pd.to_numeric(ov["FX"], errors="coerce").fillna(1.0)
+        ov["Preço"] = (pd.to_numeric(ov["Preço"], errors="coerce") * ov["FX"]).astype(float)
+        ov2 = ov[["Ticker_YF", "Moeda", "Periodo", "Preço"]].copy()
+
+        df_preco = df_preco.merge(ov2, on=["Ticker_YF", "Moeda", "Periodo"], how="outer", suffixes=("", "_override"))
+        if "Preço_override" in df_preco.columns:
+            df_preco["Preço"] = pd.to_numeric(df_preco["Preço_override"], errors="coerce").combine_first(
+                pd.to_numeric(df_preco["Preço"], errors="coerce")
+            )
+            df_preco = df_preco.drop(columns=["Preço_override"], errors="ignore")
+
+    pos = pos.merge(df_preco, on=["Ticker_YF", "Moeda", "Periodo"], how="left")
+    pos["Preço"] = pd.to_numeric(pos.get("Preço"), errors="coerce")
+    pos["Valor"] = (pd.to_numeric(pos["Quantidade"], errors="coerce").fillna(0.0) * pos["Preço"]).fillna(0.0)
+
+    # Tipo (para filtros)
+    def _tipo_por_moeda(m: str) -> str:
+        m = (m or "").upper()
+        if m == "USD":
+            return "Ações Dólar"
+        if m == "EUR":
+            return "Ações Euro"
+        return "Ações"
+
+    pos["Tipo"] = pos["Moeda"].apply(_tipo_por_moeda)
+    pos["Ativo"] = pos["Ticker"]
+    pos["Mês/Ano"] = pos["Periodo"].dt.strftime("%m/%Y")
+    pos["Fonte"] = "Manual Ações"
+
+    cols = ["Ativo", "Ticker", "Quantidade", "Preço", "Valor", "Tipo", "Usuário", "Mês/Ano", "Fonte", "Moeda"]
+    return pos[cols].copy()
+
+
+def acoes_manuais_para_posicao_atual(df_acoes_lotes: pd.DataFrame) -> pd.DataFrame:
+    """Gera base mensal para Posição Atual mantendo o preço na moeda original.
+
+    - Para USD: Preço em USD e Moeda='USD' (igual o fluxo de Ações Dólar em USD na aba Posição Atual)
+    - Para BRL: Preço em BRL e Moeda='BRL'
+    """
+    if df_acoes_lotes is None or df_acoes_lotes.empty:
+        return pd.DataFrame()
+
+    df = df_acoes_lotes.copy()
+    if "Usuário" not in df.columns:
+        df["Usuário"] = "Manual"
+    df["Usuário"] = df["Usuário"].fillna("Manual").astype(str)
+
+    if "Mês Compra" not in df.columns and "Mês/Ano" in df.columns:
+        df["Mês Compra"] = df["Mês/Ano"].astype(str)
+    if "Quantidade Compra" not in df.columns and "Quantidade" in df.columns:
+        df["Quantidade Compra"] = pd.to_numeric(df["Quantidade"], errors="coerce")
+    if "Mês Venda" not in df.columns:
+        df["Mês Venda"] = ""
+    if "Quantidade Venda" not in df.columns:
+        df["Quantidade Venda"] = 0.0
+
+    df["Quantidade Compra"] = pd.to_numeric(df.get("Quantidade Compra"), errors="coerce").fillna(0.0)
+    df["Quantidade Venda"] = pd.to_numeric(df.get("Quantidade Venda"), errors="coerce").fillna(0.0)
+
+    df["Ticker"] = df.get("Ticker", "").astype(str).str.strip().str.upper()
+    df["Ticker_YF"] = df.get("Ticker_YF", "").astype(str).str.strip()
+    df["Moeda"] = df.get("Moeda", "BRL").fillna("BRL").astype(str).str.strip().str.upper()
+
+    from modules.historico_acoes_manuais import expand_lotes_para_posicao_mensal
+
+    pos = expand_lotes_para_posicao_mensal(df)
+    if pos.empty:
+        return pd.DataFrame()
+
+    overrides = _preco_compra_overrides(df)
+
+    # Preço mensal na moeda original (sem FX)
+    precos = []
+    for sym, moeda in pos[["Ticker_YF", "Moeda"]].drop_duplicates().itertuples(index=False):
+        sym2 = (sym or "").strip()
+        if not sym2:
+            continue
+        close = _yf_close_mensal(sym2)
+        if close.empty:
+            continue
+        dfp = pd.DataFrame({
+            "Ticker_YF": sym2,
+            "Moeda": moeda,
+            "Periodo": close.index,
+            "Preço": pd.to_numeric(close.values, errors="coerce"),
+        })
+        precos.append(dfp)
+
+    df_preco = pd.concat(precos, ignore_index=True) if precos else pd.DataFrame(columns=["Ticker_YF", "Moeda", "Periodo", "Preço"])
+
+    if not overrides.empty:
+        ov2 = overrides.rename(columns={"Preço Compra": "Preço"})[["Ticker_YF", "Moeda", "Periodo", "Preço"]].copy()
+        df_preco = df_preco.merge(ov2, on=["Ticker_YF", "Moeda", "Periodo"], how="outer", suffixes=("", "_override"))
+        if "Preço_override" in df_preco.columns:
+            df_preco["Preço"] = pd.to_numeric(df_preco["Preço_override"], errors="coerce").combine_first(
+                pd.to_numeric(df_preco["Preço"], errors="coerce")
+            )
+            df_preco = df_preco.drop(columns=["Preço_override"], errors="ignore")
+    pos = pos.merge(df_preco, on=["Ticker_YF", "Moeda", "Periodo"], how="left")
+
+    def _tipo_por_moeda(m: str) -> str:
+        m = (m or "").upper()
+        if m == "USD":
+            return "Ações Dólar"
+        if m == "EUR":
+            return "Ações Euro"
+        return "Ações"
+
+    pos["Tipo"] = pos["Moeda"].apply(_tipo_por_moeda)
+    pos["Ativo"] = pos["Ticker"]
+    pos["Mês/Ano"] = pos["Periodo"].dt.strftime("%m/%Y")
+    pos["Fonte"] = "Manual Ações"
+
+    # Valor em moeda original (serve como Valor Base; atualização converte se USD)
+    pos["Valor"] = (pd.to_numeric(pos["Quantidade"], errors="coerce").fillna(0.0) * pd.to_numeric(pos.get("Preço"), errors="coerce")).fillna(0.0)
+
+    cols = ["Ativo", "Ticker", "Quantidade", "Preço", "Valor", "Tipo", "Usuário", "Mês/Ano", "Fonte", "Moeda"]
+    return pos[cols].copy()
+
+
+def carregar_acoes_hist_mensal_cached(df_acoes_lotes: pd.DataFrame) -> pd.DataFrame:
+    """Histórico mensal (Preço/Valor em BRL) persistido em parquet.
+
+    Recalcula apenas quando o parquet de lotes muda (edições) ou quando muda o mês corrente.
+    """
+    PARQUET_PATH = "data/investimentos_manuais_acoes_hist_mensal.parquet"
+    META_PATH = "data/investimentos_manuais_acoes_hist_mensal_meta.json"
+    meta_new = {
+        "schema_version": 3,
+        "acoes_manuais_mtime": _mtime_or_none(ACOES_MANUAIS_PATH),
+        "current_ym": datetime.now().strftime("%Y-%m"),
+    }
+    return _load_or_build_parquet_cached(
+        parquet_path=PARQUET_PATH,
+        meta_path=META_PATH,
+        meta_new=meta_new,
+        build_fn=lambda: acoes_manuais_para_consolidado_mensal(df_acoes_lotes),
+    )
+
+
+def carregar_acoes_posicao_cached(df_acoes_lotes: pd.DataFrame) -> pd.DataFrame:
+    """Base mensal para Posição Atual (Preço/Valor na moeda original) persistida em parquet."""
+    PARQUET_PATH = "data/investimentos_manuais_acoes_posicao.parquet"
+    META_PATH = "data/investimentos_manuais_acoes_posicao_meta.json"
+    meta_new = {
+        "schema_version": 3,
+        "acoes_manuais_mtime": _mtime_or_none(ACOES_MANUAIS_PATH),
+        "current_ym": datetime.now().strftime("%Y-%m"),
+    }
+    return _load_or_build_parquet_cached(
+        parquet_path=PARQUET_PATH,
+        meta_path=META_PATH,
+        meta_new=meta_new,
+        build_fn=lambda: acoes_manuais_para_posicao_atual(df_acoes_lotes),
+    )
+
+
+def carregar_caixa_hist_full_cached(df_caixa: pd.DataFrame) -> pd.DataFrame:
+    """Histórico completo de caixa com Rentabilidade Acumulada (%) persistido em parquet."""
+    PARQUET_PATH = "data/investimentos_manuais_caixa_hist_full.parquet"
+    META_PATH = "data/investimentos_manuais_caixa_hist_full_meta.json"
+    meta_new = {
+        "schema_version": 1,
+        "caixa_mtime": _mtime_or_none(CAIXA_PATH),
+    }
+
+    def _build() -> pd.DataFrame:
+        if df_caixa is None or df_caixa.empty:
+            return pd.DataFrame()
+        d = df_caixa.copy()
+        if "Mês" in d.columns:
+            d["Mês"] = d["Mês"].astype(str)
+            d["_DataMes"] = pd.to_datetime("01/" + d["Mês"].astype(str), format="%d/%m/%Y", errors="coerce")
+        if "Rentabilidade (%)" in d.columns:
+            d["Rentabilidade (%)"] = pd.to_numeric(d["Rentabilidade (%)"], errors="coerce").fillna(0.0)
+
+        sort_cols = [c for c in ["Usuário", "Nome Caixa", "_DataMes"] if c in d.columns]
+        if sort_cols:
+            d = d.sort_values(sort_cols).copy()
+
+        group_cols = [c for c in ["Usuário", "Nome Caixa"] if c in d.columns]
+        if "Rentabilidade (%)" in d.columns:
+            if group_cols:
+                d["Rentabilidade Acumulada (%)"] = (
+                    (1 + (d["Rentabilidade (%)"] / 100.0)).groupby([d[c] for c in group_cols]).cumprod() - 1
+                ) * 100.0
+            else:
+                d["Rentabilidade Acumulada (%)"] = ((1 + (d["Rentabilidade (%)"] / 100.0)).cumprod() - 1) * 100.0
+
+        if "_DataMes" in d.columns:
+            d = d.drop(columns=["_DataMes"], errors="ignore")
+        return d
+
+    return _load_or_build_parquet_cached(
+        parquet_path=PARQUET_PATH,
+        meta_path=META_PATH,
+        meta_new=meta_new,
+        build_fn=_build,
+    )
 
 # Dividendos sintéticos de opções
 df_dividendos_opcoes = opcoes_para_dividendos_sinteticos()
@@ -1695,8 +2201,8 @@ with tab_consolidacao:
     if not df_caixa_consolidado.empty:
         frames_consolidados.append(df_caixa_consolidado)
     
-    # Adicionar ações manuais na consolidação
-    df_acoes_man_consolidado = acoes_para_consolidado(df_manual_acoes)
+    # Adicionar ações manuais na consolidação (histórico mensal derivado)
+    df_acoes_man_consolidado = carregar_acoes_hist_mensal_cached(df_manual_acoes)
     if not df_acoes_man_consolidado.empty:
         frames_consolidados.append(df_acoes_man_consolidado)
 
@@ -1946,8 +2452,85 @@ with tab_consolidacao:
                 "renda_fixa": _mtime(RENDA_FIXA_PATH),
                 "proventos": _mtime(PROVENTOS_PATH),
                 "vendas_opcoes": _mtime(str(ARQ_VENDAS_OPCOES)),
-                "rentab_version": 8,
+                "caixa": _mtime(CAIXA_PATH),
+                "acoes_manuais": _mtime(ACOES_MANUAIS_PATH),
+                "rentab_version": 10,
             }
+
+        def _preparar_caixa_base_rentabilidade(df_caixa: pd.DataFrame) -> pd.DataFrame:
+            if df_caixa is None or df_caixa.empty:
+                return pd.DataFrame(columns=[
+                    "Usuário", "Tipo", "Chave", "MesAno",
+                    "QuantidadeAnterior", "QuantidadeAtual", "QuantidadeBase",
+                    "PrecoAnterior", "PrecoAtual", "ValorInicial", "ValorFinal",
+                    "Dividendos", "RetornoPct",
+                    "PeriodoStr", "PeriodoOrd",
+                ])
+
+            dfc = df_caixa.copy()
+            mes_col = "Mês" if "Mês" in dfc.columns else "Mes" if "Mes" in dfc.columns else None
+            if mes_col is None:
+                return pd.DataFrame(columns=[
+                    "Usuário", "Tipo", "Chave", "MesAno",
+                    "QuantidadeAnterior", "QuantidadeAtual", "QuantidadeBase",
+                    "PrecoAnterior", "PrecoAtual", "ValorInicial", "ValorFinal",
+                    "Dividendos", "RetornoPct",
+                    "PeriodoStr", "PeriodoOrd",
+                ])
+
+            dfc["Usuário"] = dfc.get("Usuário", "Manual").fillna("Manual")
+            dfc["Tipo"] = "Renda Fixa"
+            dfc["Chave"] = dfc.get("Nome Caixa", "Caixa").fillna("Caixa").apply(_norm_key)
+
+            dfc["Periodo"] = dfc[mes_col].apply(_parse_mes_ano_to_periodo)
+            dfc = dfc[dfc["Periodo"].notna()].copy()
+            dfc["PeriodoStr"] = dfc["Periodo"].astype(str)
+            dfc["PeriodoOrd"] = dfc["Periodo"].apply(lambda p: int(p.ordinal))
+
+            vi = pd.to_numeric(dfc.get("Valor Inicial"), errors="coerce").fillna(0.0)
+            vf = pd.to_numeric(dfc.get("Valor Final"), errors="coerce").fillna(0.0)
+            dep = pd.to_numeric(dfc.get("Depósitos"), errors="coerce").fillna(0.0)
+            saq = pd.to_numeric(dfc.get("Saques"), errors="coerce").fillna(0.0)
+            fluxo = (dep - saq).astype(float)
+            fechado = dfc.get("Fechado", True)
+            try:
+                fechado = fechado.astype(bool)
+            except Exception:
+                fechado = True
+
+            # Mês em aberto: considerar VF=VI e retorno=0
+            vf_eff = np.where(pd.Series(fechado).fillna(True), vf, vi)
+            retorno = np.where(
+                (pd.Series(fechado).fillna(True)) & (vi > 0),
+                ((vf_eff - dep + saq) - vi) / vi * 100.0,
+                0.0,
+            )
+
+            retorno_s = pd.Series(retorno, index=dfc.index)
+            fluxo_s = pd.Series(fluxo, index=dfc.index)
+
+            out = pd.DataFrame({
+                "Usuário": dfc["Usuário"].astype(str),
+                "Tipo": dfc["Tipo"].astype(str),
+                "Chave": dfc["Chave"].astype(str),
+                "MesAno": dfc["Periodo"].apply(_periodo_to_label),
+                "QuantidadeAnterior": 1.0,
+                "QuantidadeAtual": 1.0,
+                "QuantidadeBase": 1.0,
+                "PrecoAnterior": vi,
+                "PrecoAtual": vf_eff,
+                "ValorInicial": vi,
+                "ValorFinal": vf_eff,
+                "Dividendos": 0.0,
+                "RetornoPct": pd.to_numeric(retorno_s, errors="coerce").fillna(0.0).astype(float),
+                "Fluxo": pd.to_numeric(fluxo_s, errors="coerce").fillna(0.0).astype(float),
+                "PeriodoStr": dfc["PeriodoStr"].astype(str),
+                "PeriodoOrd": pd.to_numeric(dfc["PeriodoOrd"], errors="coerce").fillna(0).astype(int),
+            })
+
+            # Evita linhas com chave vazia
+            out = out[out["Chave"].astype(str).str.strip() != ""].copy()
+            return out
 
         def _preparar_posicoes(df_cons: pd.DataFrame) -> pd.DataFrame:
             if df_cons.empty:
@@ -2121,7 +2704,7 @@ with tab_consolidacao:
             ]
             return dfp[cols]
 
-        def _carregar_ou_gerar_base(df_posicoes: pd.DataFrame, df_div: pd.DataFrame) -> pd.DataFrame:
+        def _carregar_ou_gerar_base(df_posicoes: pd.DataFrame, df_div: pd.DataFrame, df_caixa: pd.DataFrame) -> pd.DataFrame:
             meta_old = _ler_meta()
             meta_new = _meta_atual()
             needs_rebuild = (meta_old != meta_new) or (not os.path.exists(RENTAB_PARQUET_PATH))
@@ -2132,9 +2715,30 @@ with tab_consolidacao:
                 except Exception:
                     needs_rebuild = True
 
-            df_pos = _preparar_posicoes(df_posicoes)
+            # Para rentabilidade, o Caixa precisa usar sua própria fórmula (VI/Dep/Saq/VF)
+            # então removemos as linhas de Caixa do consolidado antes de preparar posições,
+            # e incluímos depois como base já calculada.
+            df_pos_src = df_posicoes.copy() if isinstance(df_posicoes, pd.DataFrame) else pd.DataFrame()
+            if not df_pos_src.empty and "Fonte" in df_pos_src.columns:
+                df_pos_src = df_pos_src[df_pos_src["Fonte"].astype(str) != "Manual Caixa"].copy()
+
+            df_pos = _preparar_posicoes(df_pos_src)
             df_div_prep = _preparar_dividendos(df_div)
             base = _calcular_base_rentabilidade(df_pos, df_div_prep)
+
+            if "Fluxo" not in base.columns:
+                base["Fluxo"] = 0.0
+
+            base_caixa = _preparar_caixa_base_rentabilidade(df_caixa)
+            if not base_caixa.empty:
+                # Garante mesmas colunas da base
+                for c in base.columns:
+                    if c not in base_caixa.columns:
+                        base_caixa[c] = np.nan
+                for c in base_caixa.columns:
+                    if c not in base.columns:
+                        base[c] = np.nan
+                base = pd.concat([base, base_caixa[base.columns]], ignore_index=True)
 
             try:
                 pasta = os.path.dirname(RENTAB_PARQUET_PATH)
@@ -2179,7 +2783,7 @@ with tab_consolidacao:
             st.info("Sem dados de posições para calcular rentabilidade.")
         else:
             # Gera / carrega base detalhada (ativo x mês) e salva em parquet
-            base = _carregar_ou_gerar_base(df_consolidado_geral, df_dividendos_consolidado)
+            base = _carregar_ou_gerar_base(df_consolidado_geral, df_dividendos_consolidado, df_manual_caixa)
             if base.empty:
                 st.info("Dados insuficientes para calcular rentabilidade (precisa de meses consecutivos e ativos com preço/quantidade).")
             else:
@@ -2284,10 +2888,11 @@ with tab_consolidacao:
                         ValorInicial=("ValorInicial", "sum"),
                         ValorFinal=("ValorFinal", "sum"),
                         Dividendos=("Dividendos", "sum"),
+                        Fluxo=("Fluxo", "sum"),
                     )
                     mensal["RetornoPct"] = np.where(
                         mensal["ValorInicial"] > 0,
-                        ((mensal["ValorFinal"] + (mensal["Dividendos"] if usar_dividendos else 0.0)) - mensal["ValorInicial"]) / mensal["ValorInicial"] * 100.0,
+                        ((mensal["ValorFinal"] + (mensal["Dividendos"] if usar_dividendos else 0.0) - mensal["Fluxo"]) - mensal["ValorInicial"]) / mensal["ValorInicial"] * 100.0,
                         np.nan,
                     )
                     mensal = mensal.rename(columns={"Usuário": "Serie"})
@@ -2297,10 +2902,11 @@ with tab_consolidacao:
                         ValorInicial=("ValorInicial", "sum"),
                         ValorFinal=("ValorFinal", "sum"),
                         Dividendos=("Dividendos", "sum"),
+                        Fluxo=("Fluxo", "sum"),
                     )
                     total["RetornoPct"] = np.where(
                         total["ValorInicial"] > 0,
-                        ((total["ValorFinal"] + (total["Dividendos"] if usar_dividendos else 0.0)) - total["ValorInicial"]) / total["ValorInicial"] * 100.0,
+                        ((total["ValorFinal"] + (total["Dividendos"] if usar_dividendos else 0.0) - total["Fluxo"]) - total["ValorInicial"]) / total["ValorInicial"] * 100.0,
                         np.nan,
                     )
                     total["Serie"] = "Total"
@@ -2311,10 +2917,11 @@ with tab_consolidacao:
                         ValorInicial=("ValorInicial", "sum"),
                         ValorFinal=("ValorFinal", "sum"),
                         Dividendos=("Dividendos", "sum"),
+                        Fluxo=("Fluxo", "sum"),
                     )
                     mensal["RetornoPct"] = np.where(
                         mensal["ValorInicial"] > 0,
-                        ((mensal["ValorFinal"] + (mensal["Dividendos"] if usar_dividendos else 0.0)) - mensal["ValorInicial"]) / mensal["ValorInicial"] * 100.0,
+                        ((mensal["ValorFinal"] + (mensal["Dividendos"] if usar_dividendos else 0.0) - mensal["Fluxo"]) - mensal["ValorInicial"]) / mensal["ValorInicial"] * 100.0,
                         np.nan,
                     )
                     mensal = mensal.rename(columns={"Chave": "Serie"})
@@ -2351,6 +2958,7 @@ with tab_consolidacao:
                         (
                             (
                                 pd.to_numeric(base_tbl["ValorFinal"], errors="coerce")
+                                - (pd.to_numeric(base_tbl.get("Fluxo", 0.0), errors="coerce") if "Fluxo" in base_tbl.columns else 0.0)
                                 + (pd.to_numeric(base_tbl["Dividendos"], errors="coerce") if usar_dividendos and "Dividendos" in base_tbl.columns else 0.0)
                             )
                             - pd.to_numeric(base_tbl["ValorInicial"], errors="coerce")
@@ -2419,10 +3027,11 @@ with tab_consolidacao:
                     ValorInicial=("ValorInicial", "sum"),
                     ValorFinal=("ValorFinal", "sum"),
                     Dividendos=("Dividendos", "sum"),
+                    Fluxo=("Fluxo", "sum"),
                 )
                 mensal_tipo["RetornoPct"] = np.where(
                     mensal_tipo["ValorInicial"] > 0,
-                    ((mensal_tipo["ValorFinal"] + (mensal_tipo["Dividendos"] if usar_dividendos else 0.0)) - mensal_tipo["ValorInicial"]) / mensal_tipo["ValorInicial"] * 100.0,
+                    ((mensal_tipo["ValorFinal"] + (mensal_tipo["Dividendos"] if usar_dividendos else 0.0) - mensal_tipo["Fluxo"]) - mensal_tipo["ValorInicial"]) / mensal_tipo["ValorInicial"] * 100.0,
                     np.nan,
                 )
                 mensal_tipo = mensal_tipo.rename(columns={"Tipo": "Serie"})
@@ -2432,10 +3041,11 @@ with tab_consolidacao:
                     ValorInicial=("ValorInicial", "sum"),
                     ValorFinal=("ValorFinal", "sum"),
                     Dividendos=("Dividendos", "sum"),
+                    Fluxo=("Fluxo", "sum"),
                 )
                 total_tipo["RetornoPct"] = np.where(
                     total_tipo["ValorInicial"] > 0,
-                    ((total_tipo["ValorFinal"] + (total_tipo["Dividendos"] if usar_dividendos else 0.0)) - total_tipo["ValorInicial"]) / total_tipo["ValorInicial"] * 100.0,
+                    ((total_tipo["ValorFinal"] + (total_tipo["Dividendos"] if usar_dividendos else 0.0) - total_tipo["Fluxo"]) - total_tipo["ValorInicial"] ) / total_tipo["ValorInicial"] * 100.0,
                     np.nan,
                 )
                 total_tipo["Serie"] = "Total"
@@ -2541,8 +3151,8 @@ with tab_posicao:
     if not df_caixa_consolidado_pos.empty:
         frames_consolidados.append(df_caixa_consolidado_pos)
     
-    # Adicionar ações manuais na posição atual  
-    df_acoes_man_consolidado_pos = acoes_para_consolidado(df_manual_acoes)
+    # Adicionar ações manuais na posição atual (histórico mensal derivado)
+    df_acoes_man_consolidado_pos = carregar_acoes_posicao_cached(df_manual_acoes)
     if not df_acoes_man_consolidado_pos.empty:
         frames_consolidados.append(df_acoes_man_consolidado_pos)
 
@@ -2572,10 +3182,19 @@ with tab_posicao:
         except Exception:
             base_sig = None
 
+        # FIX definitivo: se o servidor ficar ligado, o session_state pode manter as cotações do dia anterior.
+        # Força atualização automaticamente quando virar o dia, ou quando a última atualização ficar “velha”.
+        now_dt = datetime.now()
+        last_dt = st.session_state.get("posicao_atual_ultima_atualizacao")
+        stale_by_day = isinstance(last_dt, datetime) and (last_dt.date() != now_dt.date())
+        stale_by_age = (not isinstance(last_dt, datetime)) or ((now_dt - last_dt).total_seconds() > 60 * 30)  # 30 min
+
         precisa_atualizar = (
             st.session_state.get("posicao_atual_df") is None
             or st.session_state.get("posicao_atual_forcar_update") is True
             or (base_sig is not None and st.session_state.get("posicao_atual_base_sig") != base_sig)
+            or stale_by_day
+            or stale_by_age
         )
 
         if precisa_atualizar:
@@ -2587,7 +3206,7 @@ with tab_posicao:
             st.session_state["posicao_atual_base_sig"] = base_sig
             st.session_state["posicao_atual_forcar_update"] = False
 
-        # Exibir timestamp de atualização (sempre com hora atual se houver atualização recente)
+        # Exibir timestamp de atualização
         last_dt = st.session_state.get("posicao_atual_ultima_atualizacao")
         with col_b:
             if isinstance(last_dt, datetime):
@@ -2976,68 +3595,59 @@ with tab_outros:
                     key="caixa_val_ini"
                 )
             with col_c5:
-                val_caixa_fim = st.number_input(
-                    "Valor Final do mês (R$)",
-                    min_value=0.0,
-                    step=100.0,
-                    key="caixa_val_fim"
+                fechar_mes_caixa = st.checkbox(
+                    "Mês fechado (valor final confirmado)",
+                    value=False,
+                    key="caixa_fechado",
+                    help="Enquanto estiver em aberto, o Valor Final fica igual ao Valor Inicial e não cria o próximo mês automaticamente.",
                 )
 
-            st.markdown("#### Movimentações no mês")
-            st.caption("💳 Adicione quantos depósitos (créditos) e saques (débitos) quiser. O sistema calcula automaticamente.")
-            df_mov_default = pd.DataFrame(
-                [{"Tipo": "Depósito", "Valor": 0.0}],
-                columns=["Tipo", "Valor"],
-            )
-            # Garantir que sempre temos um DataFrame válido
-            caixa_movs_data = st.session_state.get("caixa_movs", df_mov_default)
-            if isinstance(caixa_movs_data, list):
-                caixa_movs_data = df_mov_default
-            elif not isinstance(caixa_movs_data, pd.DataFrame):
-                caixa_movs_data = df_mov_default
-            
-            df_mov = st.data_editor(
-                caixa_movs_data,
-                num_rows="dynamic",
-                use_container_width=True,
-                key="caixa_movs",
-                column_config={
-                    "Tipo": st.column_config.SelectboxColumn(
-                        "Tipo",
-                        options=["Depósito", "Saque"],
-                        required=True,
-                    ),
-                    "Valor": st.column_config.NumberColumn(
-                        "Valor (R$)",
+                if fechar_mes_caixa:
+                    val_caixa_fim = st.number_input(
+                        "Valor Final do mês (R$)",
                         min_value=0.0,
-                        step=10.0,
-                        format="%.2f",
-                        required=True,
-                    ),
-                },
+                        step=100.0,
+                        key="caixa_val_fim",
+                    )
+                else:
+                    st.number_input(
+                        "Valor Final do mês (R$)",
+                        min_value=0.0,
+                        step=100.0,
+                        value=float(val_caixa_ini or 0.0),
+                        disabled=True,
+                        key="caixa_val_fim_preview",
+                        help="Mês em aberto: Valor Final = Valor Inicial. Feche o mês para informar o valor final real.",
+                    )
+                    val_caixa_fim = float(val_caixa_ini or 0.0)
+
+            st.markdown("#### Movimentações no mês")
+            st.caption(
+                "Para deixar a página mais rápida, os lançamentos de **Crédito/Débito** ficam apenas no bloco "
+                "**✏️ Editar caixa existente** (logo abaixo), onde o mês/usuário/caixa já está selecionado."
             )
+            df_mov = pd.DataFrame()
 
             dep_vals = []
             saq_vals = []
-            try:
-                if isinstance(df_mov, pd.DataFrame) and not df_mov.empty:
-                    tipos = df_mov.get("Tipo", pd.Series(dtype=str)).astype(str)
-                    valores = pd.to_numeric(df_mov.get("Valor", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
-                    dep_vals = valores[tipos.str.strip().str.lower().eq("depósito")].tolist()
-                    saq_vals = valores[tipos.str.strip().str.lower().eq("saque")].tolist()
-            except Exception:
-                dep_vals, saq_vals = [], []
+            dep_vals, saq_vals = [], []
 
             col_calc1, col_calc2 = st.columns(2)
             with col_calc1:
                 if st.button("🧮 Calcular rentabilidade", key="btn_calc_caixa"):
                     try:
-                        dep_total, saq_total, rent_pct, ganho = calcular_caixa(
-                            valor_inicial=val_caixa_ini,
-                            depositos=dep_vals,
-                            saques=saq_vals,
-                            valor_final=val_caixa_fim,
-                        )
+                        if not st.session_state.get("caixa_fechado", False):
+                            st.info("Mês em aberto: rentabilidade/ganho ficam em 0 até você fechar o mês.")
+                            dep_total = 0.0
+                            saq_total = 0.0
+                            rent_pct, ganho = 0.0, 0.0
+                        else:
+                            dep_total, saq_total, rent_pct, ganho = calcular_caixa(
+                                valor_inicial=val_caixa_ini,
+                                depositos=0.0,
+                                saques=0.0,
+                                valor_final=val_caixa_fim,
+                            )
                         st.session_state["caixa_calc"] = {
                             "dep_total": dep_total,
                             "saq_total": saq_total,
@@ -3081,12 +3691,18 @@ with tab_outros:
                         mes_caixa,
                         val_caixa_ini,
                         usuario=usr_caixa_safe,
-                        depositos=dep_vals,
-                        saques=saq_vals,
+                        depositos=0.0,
+                        saques=0.0,
                         valor_final=val_caixa_fim,
                         nome_caixa=nome_caixa or "Caixa Principal",
+                        fechado=bool(st.session_state.get("caixa_fechado", False)),
                     )
-                    st.success(f"✅ Caixa '{nome_caixa}' salvo para {mes_caixa}!")
+                    if isinstance(df_caixa_new, pd.DataFrame):
+                        st.session_state["caixa_df_cache"] = df_caixa_new
+                    if bool(st.session_state.get("caixa_fechado", False)):
+                        st.success(f"✅ Caixa '{nome_caixa}' FECHADO e salvo para {mes_caixa}! Próximo mês será criado/atualizado automaticamente.")
+                    else:
+                        st.success(f"✅ Caixa '{nome_caixa}' salvo para {mes_caixa} (em aberto).")
                     st.balloons()
                     st.session_state.pop("caixa_calc", None)  # Limpar cálculo anterior
                     st.rerun()
@@ -3095,229 +3711,656 @@ with tab_outros:
             
             st.markdown("---")
             st.subheader("📋 Histórico de Caixas")
-            df_caixa_view = carregar_caixa()
+            col_load1, col_load2, col_load3 = st.columns([1, 1, 1])
+            with col_load1:
+                btn_caixa_load = st.button(
+                    "📥 Carregar/Atualizar caixas",
+                    key="btn_caixa_load",
+                    help="Carrega os dados uma vez e mantém em memória; assim a aba não fica lendo o parquet a cada mudança de filtro.",
+                )
+            with col_load2:
+                btn_caixa_clear = st.button(
+                    "🧹 Limpar cache",
+                    key="btn_caixa_clear",
+                    help="Limpa o cache em memória desta aba (não apaga dados).",
+                )
+            with col_load3:
+                pass
+
+            if btn_caixa_clear:
+                st.session_state.pop("caixa_df_cache", None)
+                st.session_state.pop("caixa_hist_filters_applied", None)
+                st.session_state.pop("caixa_hist_df", None)
+                st.session_state.pop("caixa_edit_loaded", None)
+                st.rerun()
+
+            if btn_caixa_load or ("caixa_df_cache" not in st.session_state):
+                try:
+                    st.session_state["caixa_df_cache"] = carregar_caixa_fast()
+                except Exception:
+                    st.session_state["caixa_df_cache"] = carregar_caixa()
+
+            df_caixa_view = st.session_state.get("caixa_df_cache")
+            if not isinstance(df_caixa_view, pd.DataFrame):
+                df_caixa_view = pd.DataFrame()
+
+            # Tabela com todos os caixas existentes (1 linha por Usuário + Nome Caixa)
             if not df_caixa_view.empty:
-                # Filtros para visualização
-                col_f1, col_f2, col_f3 = st.columns(3)
-                with col_f1:
-                    usuarios_disponiveis = sorted(df_caixa_view["Usuário"].dropna().unique().tolist()) if "Usuário" in df_caixa_view.columns else []
-                    filtro_usuario = st.multiselect("Filtrar por Usuário", ["Todos"] + usuarios_disponiveis, default=["Todos"], key="caixa_filtro_usr")
-                with col_f2:
-                    caixas_disponiveis = sorted(df_caixa_view["Nome Caixa"].dropna().unique().tolist()) if "Nome Caixa" in df_caixa_view.columns else []
-                    filtro_caixa = st.multiselect("Filtrar por Caixa", ["Todos"] + caixas_disponiveis, default=["Todos"], key="caixa_filtro_nome")
-                with col_f3:
-                    meses_disponiveis = sorted(df_caixa_view["Mês"].dropna().unique().tolist(), reverse=True) if "Mês" in df_caixa_view.columns else []
-                    filtro_mes = st.multiselect("Filtrar por Mês", ["Todos"] + meses_disponiveis, default=["Todos"], key="caixa_filtro_mes")
-                
-                # Aplicar filtros
-                df_caixa_hist = df_caixa_view.copy()
-                if "Todos" not in filtro_usuario and filtro_usuario:
-                    df_caixa_hist = df_caixa_hist[df_caixa_hist["Usuário"].isin(filtro_usuario)]
-                if "Todos" not in filtro_caixa and filtro_caixa:
-                    df_caixa_hist = df_caixa_hist[df_caixa_hist["Nome Caixa"].isin(filtro_caixa)]
-                if "Todos" not in filtro_mes and filtro_mes:
-                    df_caixa_hist = df_caixa_hist[df_caixa_hist["Mês"].isin(filtro_mes)]
-                
-                # Ordenar e calcular acumulado
-                if "Mês" in df_caixa_hist.columns:
-                    df_caixa_hist["Mês"] = df_caixa_hist["Mês"].astype(str)
-                if "Rentabilidade (%)" in df_caixa_hist.columns:
-                    df_caixa_hist["Rentabilidade (%)"] = pd.to_numeric(df_caixa_hist["Rentabilidade (%)"], errors="coerce")
-                    if "Mês" in df_caixa_hist.columns:
-                        df_caixa_hist["_DataMes"] = pd.to_datetime(
-                            "01/" + df_caixa_hist["Mês"].astype(str),
+                try:
+                    df_caixas_exist = df_caixa_view.copy()
+                    if "Mês" in df_caixas_exist.columns:
+                        df_caixas_exist["Mês"] = df_caixas_exist["Mês"].astype(str)
+                        df_caixas_exist["_DataMes"] = pd.to_datetime(
+                            "01/" + df_caixas_exist["Mês"].astype(str),
                             format="%d/%m/%Y",
                             errors="coerce",
                         )
-                    # Ordenar por Usuário, Nome Caixa e Data
-                    sort_cols = []
-                    if "Usuário" in df_caixa_hist.columns:
-                        sort_cols.append("Usuário")
-                    if "Nome Caixa" in df_caixa_hist.columns:
-                        sort_cols.append("Nome Caixa")
-                    if "_DataMes" in df_caixa_hist.columns:
-                        sort_cols.append("_DataMes")
+                    sort_cols = [c for c in ["Usuário", "Nome Caixa", "_DataMes", "Data Registro"] if c in df_caixas_exist.columns]
                     if sort_cols:
-                        df_caixa_hist = df_caixa_hist.sort_values(sort_cols).copy()
-                    
-                    # Calcular rentabilidade acumulada por Usuário e Nome Caixa
-                    group_cols = []
-                    if "Usuário" in df_caixa_hist.columns:
-                        group_cols.append("Usuário")
-                    if "Nome Caixa" in df_caixa_hist.columns:
-                        group_cols.append("Nome Caixa")
-                    
-                    if group_cols:
-                        df_caixa_hist["Rentabilidade Acumulada (%)"] = (
-                            (1 + (df_caixa_hist["Rentabilidade (%)"].fillna(0.0) / 100.0))
-                            .groupby([df_caixa_hist[col] for col in group_cols])
-                            .cumprod() - 1
-                        ) * 100.0
-                    else:
-                        df_caixa_hist["Rentabilidade Acumulada (%)"] = (
-                            (1 + (df_caixa_hist["Rentabilidade (%)"].fillna(0.0) / 100.0)).cumprod() - 1
-                        ) * 100.0
-                    
-                    if "_DataMes" in df_caixa_hist.columns:
-                        df_caixa_hist = df_caixa_hist.drop(columns=["_DataMes"])
+                        df_caixas_exist = df_caixas_exist.sort_values(sort_cols)
+                    if "Usuário" in df_caixas_exist.columns and "Nome Caixa" in df_caixas_exist.columns:
+                        df_caixas_exist = df_caixas_exist.groupby(["Usuário", "Nome Caixa"], as_index=False).tail(1)
+                    if "_DataMes" in df_caixas_exist.columns:
+                        df_caixas_exist = df_caixas_exist.drop(columns=["_DataMes"])
 
-                # Exibir estatísticas gerais
-                if not df_caixa_hist.empty:
-                    st.markdown("#### 📊 Resumo Geral")
-                    col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
-                    with col_stat1:
-                        total_caixas = df_caixa_hist["Nome Caixa"].nunique() if "Nome Caixa" in df_caixa_hist.columns else 0
-                        st.metric("Total de Caixas", total_caixas)
-                    with col_stat2:
-                        total_registros = len(df_caixa_hist)
-                        st.metric("Total de Registros", total_registros)
-                    with col_stat3:
-                        ganho_total = df_caixa_hist["Ganho"].sum() if "Ganho" in df_caixa_hist.columns else 0
-                        st.metric("Ganho Total (R$)", f"R$ {ganho_total:,.2f}")
-                    with col_stat4:
-                        rent_media = df_caixa_hist["Rentabilidade (%)"].mean() if "Rentabilidade (%)" in df_caixa_hist.columns else 0
-                        st.metric("Rent. Média (%)", f"{rent_media:.2f}%")
+                    st.markdown("#### 📌 Caixas existentes")
+                    cols_lista = [
+                        c for c in ["Usuário", "Nome Caixa", "Mês", "Fechado", "Valor Inicial", "Valor Final"]
+                        if c in df_caixas_exist.columns
+                    ]
+                    st.dataframe(df_caixas_exist[cols_lista], use_container_width=True, hide_index=True)
+                except Exception:
+                    st.markdown("#### 📌 Caixas existentes")
+                    cols_lista = [c for c in ["Usuário", "Nome Caixa", "Mês", "Fechado"] if c in df_caixa_view.columns]
+                    st.dataframe(df_caixa_view[cols_lista].drop_duplicates(), use_container_width=True, hide_index=True)
 
-                cols_caixa_show = [
-                    c for c in ["Nome Caixa", "Usuário", "Mês", "Valor Inicial", "Depósitos", "Saques", "Valor Final", "Rentabilidade (%)", "Ganho", "Rentabilidade Acumulada (%)"]
-                    if c in df_caixa_hist.columns
+                # Prévia simples do histórico (leve) para garantir visibilidade do que existe
+                st.markdown("#### 📋 Histórico (todos os registros)")
+                cols_hist_preview = [
+                    c
+                    for c in [
+                        "Nome Caixa",
+                        "Usuário",
+                        "Mês",
+                        "Fechado",
+                        "Valor Inicial",
+                        "Depósitos",
+                        "Saques",
+                        "Valor Final",
+                        "Rentabilidade (%)",
+                        "Ganho",
+                    ]
+                    if c in df_caixa_view.columns
                 ]
-                st.dataframe(df_caixa_hist[cols_caixa_show], use_container_width=True, hide_index=True)
+                st.dataframe(df_caixa_view[cols_hist_preview], use_container_width=True, hide_index=True)
+            else:
+                st.info("Nenhum registro de caixa encontrado. Adicione o primeiro caixa acima.")
 
-                st.markdown("---")
-                st.markdown("#### 🗑️ Excluir registros")
-                df_del = df_caixa_hist.copy()
-                df_del["Excluir"] = False
-                cols_del = [c for c in ["Excluir", "Nome Caixa", "Usuário", "Mês", "Valor Inicial", "Depósitos", "Saques", "Valor Final", "Rentabilidade (%)", "Ganho", "ID"] if c in df_del.columns]
-                df_del_ed = st.data_editor(
-                    df_del[cols_del],
-                    use_container_width=True,
-                    hide_index=True,
-                    disabled=[c for c in cols_del if c != "Excluir"],
-                    key="caixa_del_editor",
+            col_tog1, col_tog2 = st.columns(2)
+            with col_tog1:
+                caixa_toggle_edit = st.checkbox(
+                    "✏️ Editar caixa existente",
+                    value=False,
+                    key="caixa_toggle_edit",
+                    help="Ative para editar um registro existente (usa os dados já carregados em memória).",
                 )
-                col_del1, col_del2, col_del3 = st.columns(3)
-                with col_del1:
-                    if st.button("🗑️ Excluir selecionados", key="btn_del_caixa"):
-                        try:
-                            ids_del = df_del_ed.loc[df_del_ed["Excluir"] == True, "ID"].astype(str).tolist() if "ID" in df_del_ed.columns else []
-                            if ids_del:
-                                excluir_caixa(ids_del)
-                                st.success(f"✅ {len(ids_del)} registro(s) excluído(s).")
-                                st.rerun()
-                            else:
-                                st.info("Nenhum registro selecionado.")
-                        except Exception as e:
-                            st.error(f"❌ Erro ao excluir: {e}")
-                with col_del2:
-                    if st.button("🗑️ Excluir TUDO", key="btn_del_caixa_all"):
-                        if st.checkbox("⚠️ Confirmar exclusão total", key="confirm_del_all_caixa"):
-                            try:
-                                excluir_caixa(tudo=True)
-                                st.success("✅ Todos os registros de Caixa foram excluídos.")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"❌ Erro ao excluir tudo: {e}")
-                        else:
-                            st.warning("⚠️ Marque a caixa de confirmação para excluir tudo.")
-                
-                with col_del3:
-                    pass  # Espaço vazio
+            with col_tog2:
+                caixa_toggle_hist_avancado = st.checkbox(
+                    "⚙️ Histórico avançado",
+                    value=False,
+                    key="caixa_toggle_hist_avancado",
+                    help="Mostra filtros, resumo, exclusão e exportação (mais pesado).",
+                )
 
-                st.markdown("---")
-                st.markdown("#### 📥 Exportar Dados")
-                col_exp1, col_exp2 = st.columns(2)
-                with col_exp1:
-                    csv_caixa = df_caixa_hist.to_csv(index=False)
-                    st.download_button(
-                        "📥 Baixar CSV",
-                        csv_caixa,
-                        "historico_caixas.csv",
-                        "text/csv",
-                        key="dl_csv_caixa"
-                    )
-                with col_exp2:
-                    try:
-                        xlsx_caixa = df_manual_para_excel(df_caixa_hist, sheet_name="Caixas")
-                        st.download_button(
-                            "📥 Baixar Excel",
-                            xlsx_caixa,
-                            "historico_caixas.xlsx",
-                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key="dl_xlsx_caixa"
+            if isinstance(df_caixa_view, pd.DataFrame) and not df_caixa_view.empty:
+                if caixa_toggle_edit:
+                    with st.expander("✏️ Editar caixa existente (créditos/débitos/valor final)", expanded=False):
+                        st.caption(
+                            "Use para ir atualizando o mês (ex.: janeiro/2026) com créditos/débitos durante o mês e, no fim, informar o valor final. "
+                            "As alterações sobrescrevem o registro do mesmo **Mês + Usuário + Nome do Caixa**."
                         )
-                    except Exception:
-                        st.info("Excel não disponível.")
+
+                        # Seletores do registro (só carrega/aplica quando apertar o botão)
+                        with st.form("caixa_edit_select_form"):
+                            col_e1, col_e2, col_e3 = st.columns(3)
+                            with col_e1:
+                                usuarios_edit = sorted(df_caixa_view.get("Usuário", pd.Series(dtype=str)).dropna().unique().tolist())
+                                sel_usr_prev = st.session_state.get("caixa_edit_sel_usr")
+                                idx_usr = usuarios_edit.index(sel_usr_prev) if (sel_usr_prev in usuarios_edit) else (0 if usuarios_edit else None)
+                                usr_edit = st.selectbox(
+                                    "Usuário",
+                                    options=usuarios_edit,
+                                    index=idx_usr,
+                                    key="caixa_edit_usr",
+                                )
+                            with col_e2:
+                                caixas_edit = sorted(df_caixa_view.get("Nome Caixa", pd.Series(dtype=str)).dropna().unique().tolist())
+                                sel_nome_prev = st.session_state.get("caixa_edit_sel_nome")
+                                idx_nome = caixas_edit.index(sel_nome_prev) if (sel_nome_prev in caixas_edit) else (0 if caixas_edit else None)
+                                nome_edit = st.selectbox(
+                                    "Nome do Caixa",
+                                    options=caixas_edit,
+                                    index=idx_nome,
+                                    key="caixa_edit_nome",
+                                )
+                            with col_e3:
+                                df_scope_mes = df_caixa_view.copy()
+                                if usr_edit and "Usuário" in df_scope_mes.columns:
+                                    df_scope_mes = df_scope_mes[df_scope_mes["Usuário"].astype(str) == str(usr_edit)]
+                                if nome_edit and "Nome Caixa" in df_scope_mes.columns:
+                                    df_scope_mes = df_scope_mes[df_scope_mes["Nome Caixa"].astype(str) == str(nome_edit)]
+
+                                meses_edit = sorted(
+                                    df_scope_mes.get("Mês", pd.Series(dtype=str)).dropna().astype(str).unique().tolist(),
+                                    reverse=True,
+                                )
+                                sel_mes_prev = st.session_state.get("caixa_edit_sel_mes")
+                                idx_mes = meses_edit.index(sel_mes_prev) if (sel_mes_prev in meses_edit) else (0 if meses_edit else None)
+                                mes_edit = st.selectbox(
+                                    "Mês (MM/YYYY)",
+                                    options=meses_edit,
+                                    index=idx_mes,
+                                    key="caixa_edit_mes",
+                                )
+
+                            btn_load_reg = st.form_submit_button("📥 Carregar registro", type="primary")
+
+                        if btn_load_reg:
+                            st.session_state["caixa_edit_sel_usr"] = usr_edit
+                            st.session_state["caixa_edit_sel_nome"] = nome_edit
+                            st.session_state["caixa_edit_sel_mes"] = mes_edit
+                            st.session_state["caixa_edit_loaded"] = True
+
+                        if not st.session_state.get("caixa_edit_loaded", False):
+                            st.info("Selecione Usuário/Caixa/Mês e clique em **📥 Carregar registro** para editar.")
+                        else:
+                            # Usar os valores "carregados" como fonte da verdade
+                            usr_edit = st.session_state.get("caixa_edit_sel_usr", usr_edit)
+                            nome_edit = st.session_state.get("caixa_edit_sel_nome", nome_edit)
+                            mes_edit = st.session_state.get("caixa_edit_sel_mes", mes_edit)
+
+                            df_match = df_caixa_view.copy()
+                            if usr_edit and "Usuário" in df_match.columns:
+                                df_match = df_match[df_match["Usuário"].astype(str) == str(usr_edit)]
+                            if nome_edit and "Nome Caixa" in df_match.columns:
+                                df_match = df_match[df_match["Nome Caixa"].astype(str) == str(nome_edit)]
+                            if mes_edit and "Mês" in df_match.columns:
+                                df_match = df_match[df_match["Mês"].astype(str) == str(mes_edit)]
+
+                            reg = None
+                            if not df_match.empty:
+                                if "Data Registro" in df_match.columns:
+                                    try:
+                                        df_match = df_match.sort_values("Data Registro")
+                                    except Exception:
+                                        pass
+                                reg = df_match.iloc[-1].to_dict()
+
+                            if not reg:
+                                st.info("Nenhum registro encontrado para este Usuário/Caixa/Mês.")
+                            else:
+                                def _num_or(v, default: float = 0.0) -> float:
+                                    x = pd.to_numeric(v, errors="coerce")
+                                    return default if pd.isna(x) else float(x)
+
+                                vi0 = _num_or(reg.get("Valor Inicial", 0.0), 0.0)
+                                dep0 = _num_or(reg.get("Depósitos", 0.0), 0.0)
+                                saq0 = _num_or(reg.get("Saques", 0.0), 0.0)
+                                vf0 = _num_or(reg.get("Valor Final", 0.0), 0.0)
+                                fechado0 = bool(reg.get("Fechado", True))
+
+                                fechado_edit = st.checkbox(
+                                    "Mês fechado (valor final confirmado)",
+                                    value=fechado0,
+                                    key="caixa_edit_fechado",
+                                    help="Se estiver em aberto, o Valor Final fica igual ao Valor Inicial e não cria o próximo mês.",
+                                )
+
+                                col_v1, col_v2 = st.columns(2)
+                                with col_v1:
+                                    vi_edit = st.number_input(
+                                        "Valor Inicial (R$)",
+                                        min_value=0.0,
+                                        step=100.0,
+                                        value=vi0,
+                                        key="caixa_edit_vi",
+                                    )
+                                with col_v2:
+                                    if fechado_edit:
+                                        vf_edit = st.number_input(
+                                            "Valor Final (R$)",
+                                            min_value=0.0,
+                                            step=100.0,
+                                            value=vf0,
+                                            key="caixa_edit_vf",
+                                        )
+                                    else:
+                                        st.number_input(
+                                            "Valor Final (R$)",
+                                            min_value=0.0,
+                                            step=100.0,
+                                            value=float(vi_edit or 0.0),
+                                            disabled=True,
+                                            key="caixa_edit_vf_preview",
+                                            help="Mês em aberto: Valor Final = Valor Inicial.",
+                                        )
+                                        vf_edit = float(vi_edit or 0.0)
+
+                                st.markdown("#### Créditos / Débitos do mês")
+                                st.caption(
+                                    "Adicione linhas de **Crédito** (depósito) ou **Débito** (saque) e o valor. "
+                                    "O sistema direciona automaticamente para o caixa selecionado."
+                                )
+
+                                df_mov_edit = pd.DataFrame(columns=["ID", "Tipo", "Valor"])
+                                try:
+                                    try:
+                                        df_all_movs = carregar_caixa_movimentos_fast()
+                                    except Exception:
+                                        df_all_movs = carregar_caixa_movimentos()
+
+                                    if isinstance(df_all_movs, pd.DataFrame) and not df_all_movs.empty:
+                                        df_mov_edit_full = df_all_movs[
+                                            (df_all_movs.get("Usuário", pd.Series(dtype=str)).astype(str) == str(usr_edit or ""))
+                                            & (df_all_movs.get("Nome Caixa", pd.Series(dtype=str)).astype(str) == str(nome_edit or ""))
+                                            & (df_all_movs.get("Mês", pd.Series(dtype=str)).astype(str) == str(mes_edit or ""))
+                                        ].copy()
+                                        if not df_mov_edit_full.empty:
+                                            df_mov_edit = df_mov_edit_full[
+                                                [c for c in ["ID", "Tipo", "Valor"] if c in df_mov_edit_full.columns]
+                                            ].copy()
+                                            tipos_norm = df_mov_edit.get("Tipo", pd.Series(dtype=str)).astype(str).str.strip().str.lower()
+                                            df_mov_edit["Tipo"] = np.where(tipos_norm.eq("saque"), "Débito", "Crédito")
+                                except Exception:
+                                    pass
+
+                                if df_mov_edit.empty:
+                                    df_mov_edit = pd.DataFrame(
+                                        [{"ID": "", "Tipo": "Crédito", "Valor": 0.0}],
+                                        columns=["ID", "Tipo", "Valor"],
+                                    )
+
+                                editor_key_mov_edit = (
+                                    f"caixa_movs_edit_{str(usr_edit or '').strip()}_{str(nome_edit or '').strip()}_{str(mes_edit or '').strip()}"
+                                    .replace(" ", "_")
+                                    .replace("/", "_")
+                                    .replace("\\", "_")
+                                )
+
+                                df_mov_edit2 = st.data_editor(
+                                    df_mov_edit,
+                                    num_rows="dynamic",
+                                    use_container_width=True,
+                                    key=editor_key_mov_edit,
+                                    column_config={
+                                        "ID": st.column_config.TextColumn("ID", disabled=True),
+                                        "Tipo": st.column_config.SelectboxColumn("Tipo", options=["Crédito", "Débito"], required=True),
+                                        "Valor": st.column_config.NumberColumn("Valor (R$)", min_value=0.0, step=10.0, format="%.2f", required=True),
+                                    },
+                                )
+
+                                dep_edit = 0.0
+                                saq_edit = 0.0
+                                try:
+                                    tipos_e = df_mov_edit2.get("Tipo", pd.Series(dtype=str)).astype(str)
+                                    valores_e = pd.to_numeric(df_mov_edit2.get("Valor", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+                                    dep_edit = float(valores_e[tipos_e.str.strip().str.lower().eq("crédito")].sum())
+                                    saq_edit = float(valores_e[tipos_e.str.strip().str.lower().eq("débito")].sum())
+                                except Exception:
+                                    dep_edit, saq_edit = float(dep0), float(saq0)
+
+                                try:
+                                    if not fechado_edit:
+                                        dep_total_p, saq_total_p, rent_pct_p, ganho_p = float(dep_edit), float(saq_edit), 0.0, 0.0
+                                    else:
+                                        dep_total_p, saq_total_p, rent_pct_p, ganho_p = calcular_caixa(
+                                            valor_inicial=vi_edit,
+                                            depositos=dep_edit,
+                                            saques=saq_edit,
+                                            valor_final=vf_edit,
+                                        )
+                                    cpr1, cpr2, cpr3, cpr4 = st.columns(4)
+                                    with cpr1:
+                                        st.metric("Depósitos (R$)", f"R$ {dep_total_p:,.2f}")
+                                    with cpr2:
+                                        st.metric("Saques (R$)", f"R$ {saq_total_p:,.2f}")
+                                    with cpr3:
+                                        st.metric("Ganho (R$)", f"R$ {ganho_p:,.2f}")
+                                    with cpr4:
+                                        st.metric("Rentabilidade (%)", f"{rent_pct_p:.2f}%")
+                                except Exception as e:
+                                    st.warning(f"Não foi possível calcular prévia: {e}")
+
+                                if st.button("💾 Salvar alterações", key="btn_caixa_edit_save", type="primary"):
+                                    try:
+                                        try:
+                                            if isinstance(df_mov_edit2, pd.DataFrame):
+                                                mv_save = df_mov_edit2.copy()
+                                                mv_save["Tipo"] = mv_save.get("Tipo", "Crédito").astype(str)
+                                                tipos_norm = mv_save["Tipo"].str.strip().str.lower()
+                                                mv_save["Tipo"] = np.where(tipos_norm.eq("débito"), "Saque", "Depósito")
+                                                mv_save["Data"] = datetime.now().date()
+                                                mv_save["Descrição"] = ""
+                                                mv_save["Categoria"] = ""
+                                                registrar_caixa_movimentos(
+                                                    mes_ano=mes_edit,
+                                                    usuario=usr_edit or "Manual",
+                                                    nome_caixa=nome_edit or "Caixa Principal",
+                                                    movimentos=mv_save,
+                                                )
+                                        except Exception:
+                                            pass
+
+                                        df_caixa_after = registrar_caixa(
+                                            mes_edit,
+                                            vi_edit,
+                                            usuario=usr_edit or "Manual",
+                                            depositos=dep_edit,
+                                            saques=saq_edit,
+                                            valor_final=vf_edit,
+                                            nome_caixa=nome_edit or "Caixa Principal",
+                                            fechado=bool(fechado_edit),
+                                        )
+                                        if isinstance(df_caixa_after, pd.DataFrame):
+                                            st.session_state["caixa_df_cache"] = df_caixa_after
+                                        if bool(fechado_edit):
+                                            st.success("✅ Alterações salvas e mês fechado! Próximo mês foi criado/atualizado automaticamente.")
+                                        else:
+                                            st.success("✅ Alterações salvas (mês em aberto).")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"❌ Erro ao salvar alterações: {e}")
+
+                if caixa_toggle_hist_avancado:
+                    with st.form("caixa_hist_filters_form"):
+                        st.caption("Os filtros só são aplicados quando você clicar em **Aplicar filtros**.")
+                    # Filtros para visualização
+                        col_f1, col_f2, col_f3 = st.columns(3)
+                        with col_f1:
+                            usuarios_disponiveis = sorted(df_caixa_view["Usuário"].dropna().unique().tolist()) if "Usuário" in df_caixa_view.columns else []
+                            filtro_usuario = st.multiselect("Filtrar por Usuário", ["Todos"] + usuarios_disponiveis, default=["Todos"], key="caixa_filtro_usr")
+                        with col_f2:
+                            caixas_disponiveis = sorted(df_caixa_view["Nome Caixa"].dropna().unique().tolist()) if "Nome Caixa" in df_caixa_view.columns else []
+                            filtro_caixa = st.multiselect("Filtrar por Caixa", ["Todos"] + caixas_disponiveis, default=["Todos"], key="caixa_filtro_nome")
+                        with col_f3:
+                            meses_disponiveis = sorted(df_caixa_view["Mês"].dropna().unique().tolist(), reverse=True) if "Mês" in df_caixa_view.columns else []
+                            filtro_mes = st.multiselect("Filtrar por Mês", ["Todos"] + meses_disponiveis, default=["Todos"], key="caixa_filtro_mes")
+
+                        btn_apply_filters = st.form_submit_button("🔎 Aplicar filtros", type="primary")
+
+                    if btn_apply_filters:
+                        st.session_state["caixa_hist_filters_applied"] = {
+                            "usr": list(filtro_usuario or []),
+                            "caixa": list(filtro_caixa or []),
+                            "mes": list(filtro_mes or []),
+                        }
+
+                    filtros_aplicados = st.session_state.get("caixa_hist_filters_applied")
+                    if isinstance(filtros_aplicados, dict):
+                        fu = filtros_aplicados.get("usr", ["Todos"])
+                        fc = filtros_aplicados.get("caixa", ["Todos"])
+                        fm = filtros_aplicados.get("mes", ["Todos"])
+                    else:
+                        fu, fc, fm = ["Todos"], ["Todos"], ["Todos"]
+
+                    df_caixa_hist = carregar_caixa_hist_full_cached(df_caixa_view)
+                    if "Todos" not in fu and fu:
+                        df_caixa_hist = df_caixa_hist[df_caixa_hist["Usuário"].isin(fu)]
+                    if "Todos" not in fc and fc:
+                        df_caixa_hist = df_caixa_hist[df_caixa_hist["Nome Caixa"].isin(fc)]
+                    if "Todos" not in fm and fm:
+                        df_caixa_hist = df_caixa_hist[df_caixa_hist["Mês"].isin(fm)]
+
+                    if "Mês" in df_caixa_hist.columns:
+                        df_caixa_hist["Mês"] = df_caixa_hist["Mês"].astype(str)
+
+                    if not df_caixa_hist.empty:
+                        st.markdown("#### 📊 Resumo Geral")
+                        col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
+                        with col_stat1:
+                            total_caixas = df_caixa_hist["Nome Caixa"].nunique() if "Nome Caixa" in df_caixa_hist.columns else 0
+                            st.metric("Total de Caixas", total_caixas)
+                        with col_stat2:
+                            total_registros = len(df_caixa_hist)
+                            st.metric("Total de Registros", total_registros)
+                        with col_stat3:
+                            ganho_total = df_caixa_hist["Ganho"].sum() if "Ganho" in df_caixa_hist.columns else 0
+                            st.metric("Ganho Total (R$)", f"R$ {ganho_total:,.2f}")
+                        with col_stat4:
+                            rent_media = df_caixa_hist["Rentabilidade (%)"].mean() if "Rentabilidade (%)" in df_caixa_hist.columns else 0
+                            st.metric("Rent. Média (%)", f"{rent_media:.2f}%")
+
+                    cols_caixa_show = [
+                        c for c in ["Nome Caixa", "Usuário", "Mês", "Fechado", "Valor Inicial", "Depósitos", "Saques", "Valor Final", "Rentabilidade (%)", "Ganho", "Rentabilidade Acumulada (%)"]
+                        if c in df_caixa_hist.columns
+                    ]
+                    st.dataframe(df_caixa_hist[cols_caixa_show], use_container_width=True, hide_index=True)
+
+                    st.markdown("---")
+                    st.markdown("#### 🗑️ Excluir registros")
+                    df_del = df_caixa_hist.copy()
+                    df_del["Excluir"] = False
+                    cols_del = [c for c in ["Excluir", "Nome Caixa", "Usuário", "Mês", "Valor Inicial", "Depósitos", "Saques", "Valor Final", "Rentabilidade (%)", "Ganho", "ID"] if c in df_del.columns]
+                    df_del_ed = st.data_editor(
+                        df_del[cols_del],
+                        use_container_width=True,
+                        hide_index=True,
+                        disabled=[c for c in cols_del if c != "Excluir"],
+                        key="caixa_del_editor",
+                    )
+                    col_del1, col_del2, col_del3 = st.columns(3)
+                    with col_del1:
+                        if st.button("🗑️ Excluir selecionados", key="btn_del_caixa"):
+                            try:
+                                ids_del = df_del_ed.loc[df_del_ed["Excluir"] == True, "ID"].astype(str).tolist() if "ID" in df_del_ed.columns else []
+                                if ids_del:
+                                    df_after_del = excluir_caixa(ids_del)
+                                    if isinstance(df_after_del, pd.DataFrame):
+                                        st.session_state["caixa_df_cache"] = df_after_del
+                                    st.success(f"✅ {len(ids_del)} registro(s) excluído(s).")
+                                    st.rerun()
+                                else:
+                                    st.info("Nenhum registro selecionado.")
+                            except Exception as e:
+                                st.error(f"❌ Erro ao excluir: {e}")
+                    with col_del2:
+                        if st.button("🗑️ Excluir TUDO", key="btn_del_caixa_all"):
+                            if st.checkbox("⚠️ Confirmar exclusão total", key="confirm_del_all_caixa"):
+                                try:
+                                    df_after_del_all = excluir_caixa(tudo=True)
+                                    if isinstance(df_after_del_all, pd.DataFrame):
+                                        st.session_state["caixa_df_cache"] = df_after_del_all
+                                    st.success("✅ Todos os registros de Caixa foram excluídos.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"❌ Erro ao excluir tudo: {e}")
+                            else:
+                                st.warning("⚠️ Marque a caixa de confirmação para excluir tudo.")
+                    with col_del3:
+                        pass
+
+                    st.markdown("---")
+                    st.markdown("#### 📥 Exportar Dados")
+                    col_exp1, col_exp2 = st.columns(2)
+                    with col_exp1:
+                        csv_caixa = df_caixa_hist.to_csv(index=False)
+                        st.download_button(
+                            "📥 Baixar CSV",
+                            csv_caixa,
+                            "historico_caixas.csv",
+                            "text/csv",
+                            key="dl_csv_caixa",
+                        )
+                    with col_exp2:
+                        try:
+                            xlsx_caixa = df_manual_para_excel(df_caixa_hist, sheet_name="Caixas")
+                            st.download_button(
+                                "📥 Baixar Excel",
+                                xlsx_caixa,
+                                "historico_caixas.xlsx",
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="dl_xlsx_caixa",
+                            )
+                        except Exception:
+                            st.info("Excel não disponível.")
+
             else:
                 st.info("📭 Nenhum registro de caixa encontrado. Adicione o primeiro caixa acima!")
         
         # --- Ações ---
         with sec_acoes:
             st.subheader("📈 Inserir Ação Manual")
-            col_a1, col_a2 = st.columns(2)
+            st.caption(
+                "Registre a **compra** com mês/ano e quantidade. Se vender depois, edite o registro e preencha **Mês Venda** e **Quantidade Venda**. "
+                "O sistema gera o histórico mensal automaticamente e recalcula valor com a cotação do mês."
+            )
+
+            col_a1, col_a2, col_a3 = st.columns(3)
             with col_a1:
-                ticker_acao = st.text_input(
-                    "Ticker (ex: BBAS3, AAPL)",
-                    key="acao_ticker"
-                )
+                ticker_acao = st.text_input("Ticker (ex: BBAS3, AAPL)", key="acao_ticker")
             with col_a2:
-                mes_acao = st.text_input(
-                    "Mês (MM/YYYY)",
-                    value=pd.Timestamp.now().strftime("%m/%Y"),
-                    key="acao_mes"
-                )
-            
-            col_a3, col_a4 = st.columns(2)
+                dt_compra = st.date_input("Data de compra", value=pd.Timestamp.today().date(), key="acao_dt_compra")
+                mes_acao = f"{dt_compra.month:02d}/{dt_compra.year}"
             with col_a3:
-                qtd_acao = st.number_input(
-                    "Quantidade",
-                    min_value=0.0,
-                    step=1.0,
-                    key="acao_qtd"
-                )
-            with col_a4:
-                usuarios_cadastrados = sorted(df_usuarios.get("Nome", pd.Series()).dropna().unique().tolist())
-                usr_acao = st.selectbox(
-                    "Usuário",
-                    options=usuarios_cadastrados,
-                    index=0 if usuarios_cadastrados else None,
-                    key="acao_usr"
-                )
-            
-            if st.button("Buscar Preço e Registrar", key="btn_reg_acao"):
+                qtd_acao = st.number_input("Quantidade comprada", min_value=0.0, step=1.0, key="acao_qtd")
+
+            preco_compra_acao = st.number_input(
+                "Preço de compra (opcional — na moeda do ativo)",
+                min_value=0.0,
+                step=0.01,
+                format="%.4f",
+                key="acao_preco_compra",
+            )
+
+            usuarios_cadastrados = sorted(df_usuarios.get("Nome", pd.Series()).dropna().unique().tolist())
+            usr_acao = st.selectbox(
+                "Usuário",
+                options=usuarios_cadastrados,
+                index=0 if usuarios_cadastrados else None,
+                key="acao_usr",
+            )
+
+            if st.button("✅ Registrar compra", key="btn_reg_acao"):
                 if not ticker_acao or qtd_acao <= 0:
                     st.error("❌ Preencha ticker e quantidade.")
                 else:
-                    with st.spinner("Buscando preço no yfinance..."):
+                    with st.spinner("Validando ticker e registrando..."):
                         try:
                             df_acoes_new, meta = registrar_acao_manual(
                                 ticker_acao,
                                 qtd_acao,
                                 mes_acao,
-                                usuario=usr_acao or "Manual"
+                                usuario=usr_acao or "Manual",
+                                preco_compra=(preco_compra_acao if (preco_compra_acao or 0.0) > 0 else None),
                             )
-                            st.success(f"✅ Ação {ticker_acao} registrada!")
-                            st.markdown(f"""
-**Resumo:**
-- **Tipo:** {meta['tipo']}
-- **Preço Atual:** {meta['moeda']} {meta['preco']:.4f}
-- **Cotação:** 1 {meta['moeda']} = R$ {meta['fx']:.4f}
-- **Preço BRL:** R$ {meta['preco_brl']:.2f}
-- **Valor Total:** R$ {meta['valor_total_brl']:,.2f}
-                            """)
+                            st.success(f"✅ Compra registrada para {meta.get('tipo', 'Ações')}: {ticker_acao} ({mes_acao}).")
                             st.rerun()
                         except Exception as e:
                             st.error(f"❌ Erro: {e}")
             
             st.markdown("---")
-            st.subheader("Ações Inseridas")
+            st.subheader("Ações Inseridas (lotes)")
             df_acoes_view = carregar_acoes_man()
             if not df_acoes_view.empty:
-                cols_acoes_show = [
-                    c for c in ["Usuário", "Tipo", "Ticker", "Quantidade", "Preço BRL", "Valor", "Mês/Ano", "Data Registro"]
-                    if c in df_acoes_view.columns
-                ]
-                st.dataframe(df_acoes_view[cols_acoes_show], use_container_width=True, hide_index=True)
+                df_lotes = df_acoes_view.copy()
+                # Garantir colunas do schema
+                if "Mês Compra" not in df_lotes.columns and "Mês/Ano" in df_lotes.columns:
+                    df_lotes["Mês Compra"] = df_lotes["Mês/Ano"].astype(str)
+                if "Quantidade Compra" not in df_lotes.columns and "Quantidade" in df_lotes.columns:
+                    df_lotes["Quantidade Compra"] = pd.to_numeric(df_lotes["Quantidade"], errors="coerce")
+                if "Mês Venda" not in df_lotes.columns:
+                    df_lotes["Mês Venda"] = ""
+                if "Quantidade Venda" not in df_lotes.columns:
+                    df_lotes["Quantidade Venda"] = 0.0
+                if "Preço Compra" not in df_lotes.columns:
+                    df_lotes["Preço Compra"] = 0.0
+
+                cols_edit = [c for c in ["ID", "Usuário", "Ticker", "Quantidade Compra", "Preço Compra", "Mês Compra", "Quantidade Venda", "Mês Venda", "Moeda", "Ticker_YF"] if c in df_lotes.columns]
+                df_lotes_show = df_lotes[cols_edit].copy()
+
+                df_lotes_ed = st.data_editor(
+                    df_lotes_show,
+                    use_container_width=True,
+                    hide_index=True,
+                    disabled=[c for c in ["ID", "Moeda", "Ticker_YF"] if c in df_lotes_show.columns],
+                    key="acoes_lotes_editor",
+                )
+
+                col_sv1, col_sv2 = st.columns(2)
+                with col_sv1:
+                    if st.button("💾 Salvar alterações (venda/compra)", key="btn_save_lotes"):
+                        try:
+                            df_new = df_acoes_view.copy()
+                            # aplica alterações por ID
+                            if "ID" not in df_new.columns or "ID" not in df_lotes_ed.columns:
+                                raise ValueError("Sem coluna ID para atualização")
+                            df_new["ID"] = df_new["ID"].astype(str)
+                            edited = df_lotes_ed.copy()
+                            edited["ID"] = edited["ID"].astype(str)
+
+                            # Normalizações e validações básicas
+                            edited["Quantidade Compra"] = pd.to_numeric(edited.get("Quantidade Compra"), errors="coerce").fillna(0.0)
+                            edited["Quantidade Venda"] = pd.to_numeric(edited.get("Quantidade Venda"), errors="coerce").fillna(0.0)
+                            if "Preço Compra" in edited.columns:
+                                edited["Preço Compra"] = pd.to_numeric(edited.get("Preço Compra"), errors="coerce").fillna(0.0)
+                            edited["Mês Compra"] = edited.get("Mês Compra", "").astype(str)
+                            edited["Mês Venda"] = edited.get("Mês Venda", "").fillna("").astype(str)
+
+                            # validar mês
+                            p_comp = edited["Mês Compra"].apply(_parse_mes_ano_to_period_global)
+                            if p_comp.isna().any():
+                                raise ValueError("Há registros com 'Mês Compra' inválido (use MM/YYYY).")
+                            p_v = edited["Mês Venda"].apply(lambda x: _parse_mes_ano_to_period_global(x) if str(x).strip() else None)
+
+                            # validar venda
+                            invalid_q = edited["Quantidade Venda"] < 0
+                            if invalid_q.any():
+                                raise ValueError("Quantidade Venda não pode ser negativa.")
+                            invalid_gt = edited["Quantidade Venda"] > edited["Quantidade Compra"]
+                            if invalid_gt.any():
+                                raise ValueError("Quantidade Venda não pode ser maior que Quantidade Compra.")
+                            invalid_mes = (p_v.notna()) & (p_v < p_comp)
+                            if invalid_mes.any():
+                                raise ValueError("Mês Venda não pode ser anterior ao Mês Compra.")
+
+                            if "Preço Compra" in edited.columns:
+                                invalid_pc = edited["Preço Compra"] < 0
+                                if invalid_pc.any():
+                                    raise ValueError("Preço Compra não pode ser negativo.")
+
+                            # aplica
+                            for _, row in edited.iterrows():
+                                mask = df_new["ID"].astype(str) == str(row["ID"])
+                                if not mask.any():
+                                    continue
+                                for col in ["Usuário", "Ticker", "Quantidade Compra", "Preço Compra", "Mês Compra", "Quantidade Venda", "Mês Venda"]:
+                                    if col in df_new.columns and col in edited.columns:
+                                        df_new.loc[mask, col] = row.get(col)
+                                # manter colunas legadas sincronizadas
+                                if "Quantidade" in df_new.columns and "Quantidade Compra" in edited.columns:
+                                    df_new.loc[mask, "Quantidade"] = row.get("Quantidade Compra")
+                                if "Mês/Ano" in df_new.columns and "Mês Compra" in edited.columns:
+                                    df_new.loc[mask, "Mês/Ano"] = row.get("Mês Compra")
+
+                            # salva via módulo
+                            from modules.investimentos_manuais import salvar_acoes as _salvar_acoes
+                            _salvar_acoes(df_new)
+                            st.success("✅ Alterações salvas.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Erro ao salvar alterações: {e}")
+                with col_sv2:
+                    with st.expander("📊 Histórico mensal (posição gerada)", expanded=True):
+                        df_hist = carregar_acoes_hist_mensal_cached(df_acoes_view)
+                        if df_hist.empty:
+                            st.info("Sem histórico mensal gerado ainda.")
+                        else:
+                            st.dataframe(
+                                df_hist[[c for c in ["Usuário", "Tipo", "Ticker", "Quantidade", "Preço", "Valor", "Mês/Ano"] if c in df_hist.columns]]
+                                .sort_values(["Ticker", "Mês/Ano"]) ,
+                                use_container_width=True,
+                                hide_index=True,
+                            )
 
                 st.markdown("#### Excluir registros")
                 df_del_a = df_acoes_view.copy()
@@ -3373,25 +4416,54 @@ with tab_outros:
                 st.markdown("**Consolidado (Caixa + Ações)**")
                 df_caixa_all = carregar_caixa()
                 df_acoes_all = carregar_acoes_man()
-                
+
                 consolidado_parts = []
                 if not df_caixa_all.empty:
-                    cols_caixa_cons = [c for c in ["Nome Caixa", "Usuário", "Mês", "Valor Inicial", "Depósitos", "Saques", "Valor Final", "Rentabilidade (%)", "Ganho"] if c in df_caixa_all.columns]
-                    df_caixa_view_cons = df_caixa_all[cols_caixa_cons].copy()
-                    df_caixa_view_cons["Tipo"] = "Caixa"
-                    if "Mês" in df_caixa_view_cons.columns:
-                        df_caixa_view_cons = df_caixa_view_cons.rename(columns={"Mês": "Mes"})
-                    consolidado_parts.append(df_caixa_view_cons)
-                
+                    try:
+                        from modules.investimentos_manuais import caixa_para_consolidado as _caixa_para_consolidado
+                        df_caixa_cons = _caixa_para_consolidado(df_caixa_all)
+                        if not df_caixa_cons.empty:
+                            df_caixa_cons["Moeda"] = "BRL"
+                            consolidado_parts.append(df_caixa_cons)
+                    except Exception as e:
+                        st.error(f"❌ Erro ao preparar Caixa para consolidado: {e}")
+
                 if not df_acoes_all.empty:
-                    df_acoes_view_cons = df_acoes_all[[
-                        "Usuário", "Tipo", "Ticker", "Quantidade", "Preço BRL", "Valor", "Mês/Ano"
-                    ]].rename(columns={"Mês/Ano": "Mes"}).copy()
-                    consolidado_parts.append(df_acoes_view_cons)
-                
+                    try:
+                        df_acoes_cons = carregar_acoes_hist_mensal_cached(df_acoes_all)
+                        if not df_acoes_cons.empty:
+                            # Valores já estão em BRL (Preço/Valor). Mantém Moeda como moeda da cotação.
+                            df_acoes_cons["Moeda Valor"] = "BRL"
+                            consolidado_parts.append(df_acoes_cons)
+                    except Exception as e:
+                        st.error(f"❌ Erro ao preparar Ações para consolidado: {e}")
+
                 if consolidado_parts:
                     df_consolidado_man = pd.concat(consolidado_parts, ignore_index=True)
-                    st.dataframe(df_consolidado_man, use_container_width=True, hide_index=True)
+                    df_consolidado_man["Valor"] = pd.to_numeric(df_consolidado_man.get("Valor"), errors="coerce").fillna(0.0)
+
+                    # Normaliza coluna de mês
+                    if "Mês/Ano" in df_consolidado_man.columns:
+                        df_consolidado_man = df_consolidado_man.rename(columns={"Mês/Ano": "Mes"})
+                    if "Mes" not in df_consolidado_man.columns:
+                        df_consolidado_man["Mes"] = ""
+
+                    # Visão enxuta (uma coluna Valor comum para somar)
+                    cols_show = [c for c in ["Mes", "Usuário", "Tipo", "Ativo", "Ticker", "Quantidade", "Preço", "Valor", "Moeda", "Moeda Valor", "Fonte"] if c in df_consolidado_man.columns]
+
+                    total_brl = float(df_consolidado_man["Valor"].sum())
+                    st.metric("Total (Valor em BRL)", f"R$ {total_brl:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+                    sort_cols = [c for c in ["Mes", "Tipo", "Ticker", "Ativo"] if c in cols_show]
+                    df_show = df_consolidado_man[cols_show].copy()
+                    if sort_cols:
+                        df_show = df_show.sort_values(sort_cols)
+
+                    st.dataframe(
+                        df_show,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
                     
                     # Exportar consolidado
                     csv_cons = df_consolidado_man.to_csv(index=False)

@@ -975,64 +975,125 @@ def _export_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
 
 st.title("📊 Análise Fundamentalista (yfinance)")
 
+# Lista sugerida de tickers via cache local (sem chamadas de rede)
+cache_df = _load_ticker_info_cache(TICKER_INFO_PATH)
+sugestoes: list[str] = []
+if isinstance(cache_df, pd.DataFrame) and (not cache_df.empty) and "Ticker" in cache_df.columns:
+    sugestoes = sorted(cache_df["Ticker"].dropna().astype(str).str.strip().unique().tolist())
+
 with st.sidebar:
     st.subheader("🔎 Seleção")
 
-    # Lista sugerida de tickers via cache local
-    cache_df = _load_ticker_info_cache(TICKER_INFO_PATH)
-    sugestoes = []
-    if isinstance(cache_df, pd.DataFrame) and (not cache_df.empty) and "Ticker" in cache_df.columns:
-        sugestoes = sorted(cache_df["Ticker"].dropna().astype(str).str.strip().unique().tolist())
-
-    somente_validos = st.checkbox("Mostrar somente tickers válidos", value=True)
-    sugestoes_validas = sugestoes
-    if somente_validos and sugestoes:
-        sugestoes_validas = _filtrar_sugestoes_validas(sugestoes)
-
-    modo = st.radio("Modo", ["Selecionar", "Digitar"], horizontal=True)
-
-    if modo == "Selecionar" and sugestoes_validas:
-        ticker_in = st.selectbox("Ticker", sugestoes_validas, index=0)
-    else:
-        ticker_in = st.text_input("Ticker", value="PETR4")
-
-    periodo = st.selectbox("Período de preço", ["6mo", "1y", "2y", "5y", "10y", "max"], index=3)
-
-    comparar_com = st.multiselect(
-        "Comparar preços com",
-        options=[t for t in sugestoes_validas if t],
-        default=[],
-        help="Seleciona outros tickers para sobrepor no gráfico de preços.",
-    )
-    comparar_com_txt = st.text_input(
-        "Comparar (digite tickers separados por vírgula)",
-        value="",
-        help="Ex.: PETR4, VALE3, AAPL",
-    )
-
-    st.markdown("---")
-    if st.button("🔄 Atualizar dados (limpar cache)"):
+    if st.button("🔄 Limpar cache (dados)"):
         st.cache_data.clear()
+        # também limpa dados já carregados nesta sessão
+        st.session_state.pop("af_data", None)
+        st.session_state.pop("af_data_sig", None)
+        st.session_state.pop("af_params", None)
         st.rerun()
 
+    # Validação de lista (opcional) deve ser acionada pelo usuário para não travar a página ao abrir
+    if "af_sugestoes_validas" not in st.session_state:
+        st.session_state["af_sugestoes_validas"] = None
 
-ticker_base = extrair_ticker(ticker_in) or ""
+    if st.button("✅ Validar lista de tickers (yfinance)", help="Apenas se você quiser filtrar a lista para tickers que existem."):
+        if sugestoes:
+            with st.spinner("Validando tickers (pode demorar na primeira vez)..."):
+                try:
+                    st.session_state["af_sugestoes_validas"] = _filtrar_sugestoes_validas(sugestoes)
+                except Exception:
+                    st.session_state["af_sugestoes_validas"] = sugestoes
+
+    with st.form("af_form"):
+        somente_validos = st.checkbox("Mostrar somente tickers válidos", value=True)
+
+        sugestoes_validas = sugestoes
+        if somente_validos and sugestoes:
+            cached_valid = st.session_state.get("af_sugestoes_validas")
+            if isinstance(cached_valid, list) and cached_valid:
+                sugestoes_validas = cached_valid
+            else:
+                # sem validação rodada ainda; evita chamada ao yfinance aqui
+                sugestoes_validas = sugestoes
+                st.caption("Dica: clique em 'Validar lista de tickers' para filtrar.")
+
+        modo = st.radio("Modo", ["Selecionar", "Digitar"], horizontal=True)
+
+        if modo == "Selecionar" and sugestoes_validas:
+            ticker_in = st.selectbox("Ticker", sugestoes_validas, index=0)
+        else:
+            ticker_in = st.text_input("Ticker", value="PETR4")
+
+        periodo = st.selectbox("Período de preço", ["6mo", "1y", "2y", "5y", "10y", "max"], index=3)
+
+        comparar_com = st.multiselect(
+            "Comparar preços com",
+            options=[t for t in sugestoes_validas if t],
+            default=[],
+            help="Seleciona outros tickers para sobrepor no gráfico de preços.",
+        )
+        comparar_com_txt = st.text_input(
+            "Comparar (digite tickers separados por vírgula)",
+            value="",
+            help="Ex.: PETR4, VALE3, AAPL",
+        )
+
+        submitted = st.form_submit_button("📥 Carregar análise", type="primary")
+
+
+if submitted:
+    st.session_state["af_params"] = {
+        "ticker_in": ticker_in,
+        "periodo": periodo,
+        "comparar_com": list(comparar_com or []),
+        "comparar_com_txt": comparar_com_txt or "",
+    }
+
+params = st.session_state.get("af_params")
+if not isinstance(params, dict) or not params.get("ticker_in"):
+    st.info("Selecione/Informe um ticker na barra lateral e clique em **Carregar análise**.")
+    st.stop()
+
+ticker_base = extrair_ticker(params.get("ticker_in")) or ""
 if not ticker_base:
     st.info("Informe um ticker para iniciar.")
     st.stop()
 
 ticker_yf = ticker_para_yfinance(ticker_base) or ticker_base
+periodo = params.get("periodo") or "5y"
+comparar_com = params.get("comparar_com") or []
+comparar_com_txt = params.get("comparar_com_txt") or ""
 
-# Atualizar cache local de setor/segmento para o ticker selecionado
-try:
-    atualizar_cache_tickers([ticker_base])
-except Exception:
-    pass
+sig = (ticker_yf, str(periodo))
+af_data = st.session_state.get("af_data")
+if (not isinstance(af_data, dict)) or (st.session_state.get("af_data_sig") != sig) or submitted:
+    # Atualizar cache local de setor/segmento para o ticker selecionado
+    try:
+        atualizar_cache_tickers([ticker_base])
+    except Exception:
+        pass
 
-info = _yf_info(ticker_yf)
-price_df = _yf_history_price(ticker_yf, periodo)
-dividends_df = _yf_dividends(ticker_yf)
-statements = _yf_statements(ticker_yf)
+    with st.spinner("Buscando dados no yfinance..."):
+        info = _yf_info(ticker_yf)
+        price_df = _yf_history_price(ticker_yf, periodo)
+        dividends_df = _yf_dividends(ticker_yf)
+        statements = _yf_statements(ticker_yf)
+
+    st.session_state["af_data_sig"] = sig
+    st.session_state["af_data"] = {
+        "info": info,
+        "price_df": price_df,
+        "dividends_df": dividends_df,
+        "statements": statements,
+        "ticker_base": ticker_base,
+        "ticker_yf": ticker_yf,
+    }
+
+af_data = st.session_state.get("af_data") or {}
+info = af_data.get("info") or {}
+price_df = af_data.get("price_df") if isinstance(af_data.get("price_df"), pd.DataFrame) else pd.DataFrame()
+dividends_df = af_data.get("dividends_df") if isinstance(af_data.get("dividends_df"), pd.DataFrame) else pd.DataFrame()
+statements = af_data.get("statements") if isinstance(af_data.get("statements"), dict) else {}
 
 # Header com identificação
 nome = info.get("shortName") or info.get("longName") or ticker_base
