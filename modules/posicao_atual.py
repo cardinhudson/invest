@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from modules.cotacoes import obter_cotacao_atual_usd_brl
+from modules.cotacoes import obter_cotacao_atual_eur_brl, obter_cotacao_atual_usd_brl
 from modules.ticker_info import extrair_ticker, ticker_para_yfinance
 
 
@@ -158,7 +158,23 @@ def preparar_posicao_base(df_cons: pd.DataFrame, agrupar_por_usuario: bool = Fal
     else:
         dfp["Preço"] = np.nan
 
-    dfp["Moeda"] = np.where(dfp["Tipo"].astype(str).str.strip().str.upper() == "AÇÕES DÓLAR", "USD", "BRL")
+    # Moeda: se já vier no consolidado, preservar (evita problemas com espaços/unicode no Tipo).
+    # Fallback: inferir pelo Tipo.
+    tipo_norm = dfp["Tipo"].astype(str)
+    tipo_norm = tipo_norm.str.replace("\u00a0", " ", regex=False).str.strip().str.upper()
+    moeda_inferida = np.select(
+        [tipo_norm == "AÇÕES DÓLAR", tipo_norm == "AÇÕES EURO"],
+        ["USD", "EUR"],
+        default="BRL",
+    )
+    if "Moeda" in dfp.columns:
+        moeda_raw = dfp["Moeda"].fillna("").astype(str)
+        moeda_raw = moeda_raw.str.replace("\u00a0", " ", regex=False).str.strip().str.upper()
+        moeda_raw = moeda_raw.replace({"R$": "BRL", "US$": "USD", "€": "EUR"})
+        moeda_raw = moeda_raw.where(moeda_raw.isin(["BRL", "USD", "EUR"]), "")
+        dfp["Moeda"] = moeda_raw.where(moeda_raw != "", moeda_inferida)
+    else:
+        dfp["Moeda"] = moeda_inferida
 
     # Valor base do mês (para RF/TD/Opções e fallback geral)
     if "Valor" in dfp.columns:
@@ -294,16 +310,19 @@ def atualizar_cotacoes(df_posicao: pd.DataFrame) -> Tuple[pd.DataFrame, List[str
     df["Tipo"] = df["Tipo"].fillna("N/A").astype(str).str.strip()
 
     cotacao_usd_brl = obter_cotacao_atual_usd_brl()
+    cotacao_eur_brl = obter_cotacao_atual_eur_brl()
 
     # Só atualiza cotação em tempo real para ações
-    tipos_atualizaveis = {"Ações", "Ações Dólar"}
+    tipos_atualizaveis = {"Ações", "Ações Dólar", "Ações Euro"}
 
     precos_brl: List[Optional[float]] = []
     precos_usd: List[Optional[float]] = []
+    precos_eur: List[Optional[float]] = []
     fontes: List[str] = []
     tickers_yf: List[Optional[str]] = []
     sem_cotacao: List[str] = []
     cotacoes_fx: List[Optional[float]] = []
+    cotacoes_eur: List[Optional[float]] = []
     preco_hist_brl: List[Optional[float]] = []
     precos_anteriores: List[Optional[float]] = []
     variacoes_pct: List[Optional[float]] = []
@@ -325,16 +344,23 @@ def atualizar_cotacoes(df_posicao: pd.DataFrame) -> Tuple[pd.DataFrame, List[str
 
             if moeda == "USD":
                 cotacoes_fx.append(float(cotacao_usd_brl))
+                cotacoes_eur.append(np.nan)
                 precos_usd.append(np.nan)
+                precos_eur.append(np.nan)
                 precos_brl.append(np.nan)
                 preco_hist_brl.append(np.nan)
-                # Valor base está em USD (quando houver), converte para BRL
-                if pd.notna(valor_base) and float(valor_base) > 0:
-                    # Usamos 'Preço Atual' como NaN e valor atualizado diretamente
-                    pass
+            elif moeda == "EUR":
+                cotacoes_fx.append(np.nan)
+                cotacoes_eur.append(float(cotacao_eur_brl) if pd.notna(cotacao_eur_brl) else np.nan)
+                precos_usd.append(np.nan)
+                precos_eur.append(np.nan)
+                precos_brl.append(np.nan)
+                preco_hist_brl.append(np.nan)
             else:
                 cotacoes_fx.append(np.nan)
+                cotacoes_eur.append(np.nan)
                 precos_usd.append(np.nan)
+                precos_eur.append(np.nan)
                 precos_brl.append(np.nan)
                 preco_hist_brl.append(np.nan)
 
@@ -363,15 +389,32 @@ def atualizar_cotacoes(df_posicao: pd.DataFrame) -> Tuple[pd.DataFrame, List[str
 
         if moeda == "USD":
             cotacoes_fx.append(float(cotacao_usd_brl))
+            cotacoes_eur.append(np.nan)
             precos_usd.append(preco_base if pd.notna(preco_base) else np.nan)
+            precos_eur.append(np.nan)
             precos_brl.append(float(preco_base) * float(cotacao_usd_brl) if pd.notna(preco_base) else np.nan)
             if pd.notna(preco_hist) and float(preco_hist) > 0:
                 preco_hist_brl.append(float(preco_hist) * float(cotacao_usd_brl))
             else:
                 preco_hist_brl.append(np.nan)
+        elif moeda == "EUR":
+            cotacoes_fx.append(np.nan)
+            cotacoes_eur.append(float(cotacao_eur_brl) if pd.notna(cotacao_eur_brl) else np.nan)
+            precos_usd.append(np.nan)
+            precos_eur.append(preco_base if pd.notna(preco_base) else np.nan)
+            if pd.notna(preco_base) and pd.notna(cotacao_eur_brl) and float(cotacao_eur_brl) > 0:
+                precos_brl.append(float(preco_base) * float(cotacao_eur_brl))
+            else:
+                precos_brl.append(np.nan)
+            if pd.notna(preco_hist) and float(preco_hist) > 0 and pd.notna(cotacao_eur_brl) and float(cotacao_eur_brl) > 0:
+                preco_hist_brl.append(float(preco_hist) * float(cotacao_eur_brl))
+            else:
+                preco_hist_brl.append(np.nan)
         else:
             cotacoes_fx.append(np.nan)
+            cotacoes_eur.append(np.nan)
             precos_usd.append(np.nan)
+            precos_eur.append(np.nan)
             precos_brl.append(preco_base)
             preco_hist_brl.append(float(preco_hist) if pd.notna(preco_hist) else np.nan)
 
@@ -382,6 +425,8 @@ def atualizar_cotacoes(df_posicao: pd.DataFrame) -> Tuple[pd.DataFrame, List[str
     df["Preço Atual"] = pd.to_numeric(precos_brl, errors="coerce")
     df["Preço Atual (USD)"] = pd.to_numeric(precos_usd, errors="coerce")
     df["Cotação USD/BRL"] = pd.to_numeric(cotacoes_fx, errors="coerce")
+    df["Preço Atual (EUR)"] = pd.to_numeric(precos_eur, errors="coerce")
+    df["Cotação EUR/BRL"] = pd.to_numeric(cotacoes_eur, errors="coerce")
     df["Preço Anterior"] = pd.to_numeric(precos_anteriores, errors="coerce")
     df["Variação % YF"] = pd.to_numeric(variacoes_pct, errors="coerce")
     df["Fonte Preço"] = fontes
@@ -393,10 +438,12 @@ def atualizar_cotacoes(df_posicao: pd.DataFrame) -> Tuple[pd.DataFrame, List[str
     # - Para demais tipos: manter Valor Base (convertendo se necessário)
     mask_atualiza = df["Tipo"].isin(list(tipos_atualizaveis))
 
-    valor_base_brl = np.where(
-        df["Moeda"].astype(str).str.upper() == "USD",
-        pd.to_numeric(df["Valor Base"], errors="coerce") * float(cotacao_usd_brl),
-        pd.to_numeric(df["Valor Base"], errors="coerce"),
+    moeda_norm = df["Moeda"].astype(str).str.upper()
+    vb = pd.to_numeric(df["Valor Base"], errors="coerce")
+    valor_base_brl = np.select(
+        [moeda_norm == "USD", moeda_norm == "EUR"],
+        [vb * float(cotacao_usd_brl), vb * float(cotacao_eur_brl) if pd.notna(cotacao_eur_brl) else np.nan],
+        default=vb,
     )
 
     df["Valor Atualizado"] = np.where(
@@ -470,7 +517,7 @@ def preparar_tabela_posicao_estilizada(df: pd.DataFrame) -> Tuple[pd.DataFrame, 
         "Valor Atualizado",
         "Fonte Preço",
     ]
-    cols_extra = [c for c in ["Preço Atual (USD)", "Cotação USD/BRL", "Ticker YF"] if c in dfv.columns]
+    cols_extra = [c for c in ["Preço Atual (USD)", "Cotação USD/BRL", "Preço Atual (EUR)", "Cotação EUR/BRL", "Ticker YF"] if c in dfv.columns]
     cols = [c for c in cols_base if c in dfv.columns] + cols_extra
     dfv = dfv[cols].copy()
 
@@ -503,6 +550,8 @@ def preparar_tabela_posicao_estilizada(df: pd.DataFrame) -> Tuple[pd.DataFrame, 
         "Variação %": "{:+.2f}%",
         "Preço Atual (USD)": "US$ {:,.2f}",
         "Cotação USD/BRL": "{:,.4f}",
+        "Preço Atual (EUR)": "€ {:,.2f}",
+        "Cotação EUR/BRL": "{:,.4f}",
     }
     fmt = {k: v for k, v in fmt.items() if k in dfv.columns}
 

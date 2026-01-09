@@ -5,5 +5,7 @@
   "vendas_opcoes": null,
   "caixa": 1767955257.2287714,
   "acoes_manuais": 1767970426.5834658,
-  "rentab_version": 10
+  "acoes_manuais_hist_mensal": 1767971111.4158087,
+  "caixa_hist_full": null,
+  "rentab_version": 11
 }

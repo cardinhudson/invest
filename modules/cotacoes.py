@@ -152,6 +152,40 @@ def obter_cotacao_atual_usd_brl() -> float:
     return 5.80
 
 
+def obter_cotacao_atual_eur_brl() -> float:
+    """Obtém cotação atual (tempo real) de EUR/BRL.
+
+    Estratégia:
+    1) Tenta direto via yfinance (EURBRL=X)
+    2) Fallback: EURUSD=X × USD/BRL
+    3) Último recurso: fallback fixo (6.20)
+    """
+    # 1) Direto EUR/BRL
+    try:
+        ticker = yf.Ticker("EURBRL=X")
+        hist = ticker.history(period="1d")
+        if not hist.empty:
+            px = float(hist["Close"].iloc[-1])
+            if px > 0:
+                return px
+    except Exception:
+        pass
+
+    # 2) EURUSD × USDBRL
+    try:
+        ticker = yf.Ticker("EURUSD=X")
+        hist = ticker.history(period="1d")
+        if not hist.empty:
+            eurusd = float(hist["Close"].iloc[-1])
+            if eurusd > 0:
+                return eurusd * float(obter_cotacao_atual_usd_brl())
+    except Exception:
+        pass
+
+    # 3) Fallback
+    return 6.20
+
+
 def obter_historico_cotacao_usd_brl(periodo: str = "10y", intervalo: str = "1d") -> pd.DataFrame:
     """
     Obtém histórico de cotações USD/BRL.

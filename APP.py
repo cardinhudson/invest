@@ -6,6 +6,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import numpy as np
 import yfinance as yf
 from modules.ticker_info import CACHE_PATH as TICKER_INFO_PATH
@@ -452,8 +453,19 @@ def gerar_graficos_distribuicao(df, col_valor="Valor", cores="Blues", key_prefix
                 fig_bar.update_yaxes(range=[0, max_val * 1.15])
             st.plotly_chart(fig_bar, use_container_width=True, key=f"{key_prefixo}_bar")
 
-def gerar_graficos_evolucao(df: pd.DataFrame, coluna_valor: str = "Valor Líquido", coluna_data: str = "Data", chave_periodo: str = "periodo"):
-    """Gera gráficos de evolução de proventos (barras, linha e crescimento %)"""
+def gerar_graficos_evolucao(
+    df: pd.DataFrame,
+    coluna_valor: str = "Valor Líquido",
+    coluna_data: str = "Data",
+    chave_periodo: str = "periodo",
+    serie_posicao_mensal: pd.Series | None = None,
+):
+    """Gera gráficos de evolução de proventos (barras, linha e crescimento %).
+
+    Se `serie_posicao_mensal` for informada (índice "YYYY-MM"), adiciona um gráfico de linha
+    de Dividend Yield (%) acima do gráfico de barras (compartilhando o mesmo eixo X) quando
+    o período selecionado for Mensal.
+    """
     if df.empty or coluna_valor not in df.columns:
         return False
     
@@ -524,36 +536,108 @@ def gerar_graficos_evolucao(df: pd.DataFrame, coluna_valor: str = "Valor Líquid
         valores = np.array(df_group.values)
         norm = (valores - valores.min()) / (valores.max() - valores.min()) if valores.max() > valores.min() else np.full(n, 0.5)
         bar_colors = sample_colorscale(blues, norm)
-        fig_bar = px.bar(
-            x=df_group.index,
-            y=df_group.values,
-            labels={"x": "Período", "y": coluna_valor},
-            text=[f"{v:,.2f}" for v in df_group.values],
-            color_discrete_sequence=bar_colors
-        )
-        fig_bar.update_traces(textposition="outside", cliponaxis=False, marker_color=bar_colors)
+        # Se houver base de posição mensal, montar subplots (Yield + Barras) bem colados e com o mesmo eixo X
+        usar_yield = (serie_posicao_mensal is not None) and (periodo == "Mensal")
+        if usar_yield:
+            try:
+                s_pos = serie_posicao_mensal.copy()
+                if not isinstance(s_pos, pd.Series):
+                    s_pos = pd.Series(s_pos)
+                s_pos.index = s_pos.index.astype(str)
+                s_pos = pd.to_numeric(s_pos, errors="coerce")
+                s_pos = s_pos.reindex(df_group.index).fillna(0.0)
+
+                div_vals = pd.to_numeric(pd.Series(df_group.values, index=df_group.index), errors="coerce").fillna(0.0)
+                dy = np.where(s_pos.values > 0, (div_vals.values / s_pos.values) * 100.0, np.nan)
+
+                fig_bar = make_subplots(
+                    rows=2,
+                    cols=1,
+                    shared_xaxes=True,
+                    vertical_spacing=0.02,
+                    row_heights=[0.35, 0.65],
+                )
+
+                fig_bar.add_trace(
+                    go.Scatter(
+                        x=df_group.index,
+                        y=dy,
+                        mode="lines+markers",
+                        name="Dividend Yield (%)",
+                        hovertemplate="%{x}<br>Yield: %{y:.2f}%<extra></extra>",
+                    ),
+                    row=1,
+                    col=1,
+                )
+
+                fig_bar.add_trace(
+                    go.Bar(
+                        x=df_group.index,
+                        y=df_group.values,
+                        name=coluna_valor,
+                        marker_color=bar_colors,
+                        text=[f"{v:,.2f}" for v in df_group.values],
+                        textposition="outside",
+                        cliponaxis=False,
+                        hovertemplate="%{x}<br>Valor: R$ %{y:,.2f}<extra></extra>",
+                    ),
+                    row=2,
+                    col=1,
+                )
+
+                # Formatação eixos
+                fig_bar.update_yaxes(title_text="Dividend Yield (%)", ticksuffix="%", tickformat=".2f", row=1, col=1)
+                fig_bar.update_yaxes(title_text=coluna_valor, tickformat=",.2f", row=2, col=1)
+            except Exception:
+                usar_yield = False
+
+        if not usar_yield:
+            fig_bar = px.bar(
+                x=df_group.index,
+                y=df_group.values,
+                labels={"x": "Período", "y": coluna_valor},
+                text=[f"{v:,.2f}" for v in df_group.values],
+                color_discrete_sequence=bar_colors
+            )
+            fig_bar.update_traces(textposition="outside", cliponaxis=False, marker_color=bar_colors)
         
         # Adicionar linha de média móvel se selecionada
         if periodo_mm != "Sem MM":
             periodo_num = int(periodo_mm.split()[0])
             mm_values = pd.Series(df_group.values).rolling(window=periodo_num, center=False, min_periods=1).mean()
-            fig_bar.add_trace(
-                go.Scatter(
-                    x=df_group.index,
-                    y=mm_values,
-                    mode="lines+markers",
-                    name=f"MM {periodo_num}m",
-                    line=dict(color="red", width=3, dash="dash"),
-                    marker=dict(size=6),
-                    text=[f"{v:.2f}" if not pd.isna(v) else "" for v in mm_values],
-                    textposition="top center"
-                )
+            trace_mm = go.Scatter(
+                x=df_group.index,
+                y=mm_values,
+                mode="lines+markers",
+                name=f"MM {periodo_num}m",
+                line=dict(color="red", width=3, dash="dash"),
+                marker=dict(size=6),
+                hovertemplate="%{x}<br>MM: R$ %{y:,.2f}<extra></extra>",
             )
-            fig_bar.update_layout(hovermode="x unified")
+
+            # Quando o gráfico está em subplots (Yield + Barras), a MM deve ficar no painel das barras.
+            if "make_subplots" in str(type(fig_bar)) and usar_yield:
+                fig_bar.add_trace(trace_mm, row=2, col=1)
+            else:
+                fig_bar.add_trace(trace_mm)
         
-        fig_bar.update_layout(yaxis_tickformat=",.2f", xaxis_tickmode="array", xaxis_tickvals=list(df_group.index), xaxis_ticktext=list(df_group.index), margin=dict(t=60))
+        fig_bar.update_layout(
+            xaxis_tickmode="array",
+            xaxis_tickvals=list(df_group.index),
+            xaxis_ticktext=list(df_group.index),
+            margin=dict(t=60),
+            hovermode="x unified",
+            showlegend=False,
+        )
         if max_val > 0:
-            fig_bar.update_yaxes(range=[0, max_val * 1.15])
+            # Ajusta apenas o eixo do valor (barras)
+            try:
+                if usar_yield:
+                    fig_bar.update_yaxes(range=[0, max_val * 1.15], row=2, col=1)
+                else:
+                    fig_bar.update_yaxes(range=[0, max_val * 1.15])
+            except Exception:
+                pass
         st.plotly_chart(fig_bar, use_container_width=True, key=f"{chave_periodo}_bar")
 
         # Gráfico de linha
@@ -1538,25 +1622,131 @@ with tab_proventos:
         if df_dividendos_consolidado.empty:
             st.info("Sem dados de Dividendos")
         else:
-            st.success(f"✅ {len(df_dividendos_consolidado)} registros")
+            # ===== Filtrar esta página para proventos apenas de Ações (BRL/USD/EUR) =====
+            TIPOS_ACOES = {"Ações", "Ações Dólar", "Ações Euro"}
+
+            def _to_num_series_local(s: pd.Series) -> pd.Series:
+                if s is None:
+                    return pd.Series(dtype="float")
+                if not isinstance(s, pd.Series):
+                    s = pd.Series(s)
+                if pd.api.types.is_numeric_dtype(s):
+                    return pd.to_numeric(s, errors="coerce")
+                txt = s.astype(str)
+                txt = (
+                    txt.str.replace("R$", "", regex=False)
+                    .str.replace("US$", "", regex=False)
+                    .str.replace("$", "", regex=False)
+                    .str.replace("%", "", regex=False)
+                    .str.replace("\u00a0", " ", regex=False)
+                    .str.replace(" ", "", regex=False)
+                )
+                txt = txt.str.replace(r"\.(?=\d{3}(\D|$))", "", regex=True)
+                txt = txt.str.replace(",", ".", regex=False)
+                return pd.to_numeric(txt, errors="coerce")
+
+            def _ticker_curto_local(v) -> str:
+                t = extrair_ticker(v)
+                t = "" if t is None else str(t).strip().upper()
+                if t.endswith(".SA"):
+                    t = t[:-3]
+                return t
+
+            # Base de posição mensal (BRL) para calcular Dividend Yield
+            pos_parts = []
+            if not df_padronizado.empty and "Tipo" in df_padronizado.columns:
+                d0 = df_padronizado[df_padronizado["Tipo"].isin(list(TIPOS_ACOES))].copy()
+                if not d0.empty:
+                    if "Valor" not in d0.columns and "Valor de Mercado" in d0.columns:
+                        d0["Valor"] = d0["Valor de Mercado"]
+                    pos_parts.append(d0)
+
+            if not df_acoes_avenue_padrao.empty:
+                d1 = df_acoes_avenue_padrao.copy()
+                if "Tipo" in d1.columns:
+                    d1 = d1[d1["Tipo"].isin(list(TIPOS_ACOES))].copy()
+                pos_parts.append(d1)
+
+            df_acoes_manuais_hist_brl = pd.DataFrame()
+            if df_manual_acoes is not None and not df_manual_acoes.empty:
+                try:
+                    df_acoes_manuais_hist_brl = carregar_acoes_hist_mensal_cached(df_manual_acoes)
+                except Exception:
+                    df_acoes_manuais_hist_brl = pd.DataFrame()
+            if df_acoes_manuais_hist_brl is not None and not df_acoes_manuais_hist_brl.empty:
+                d2 = df_acoes_manuais_hist_brl.copy()
+                if "Tipo" in d2.columns:
+                    d2 = d2[d2["Tipo"].isin(list(TIPOS_ACOES))].copy()
+                pos_parts.append(d2)
+
+            df_pos_acoes = pd.concat(pos_parts, ignore_index=True) if pos_parts else pd.DataFrame()
+            if not df_pos_acoes.empty:
+                if "Ticker" not in df_pos_acoes.columns and "Ativo" in df_pos_acoes.columns:
+                    df_pos_acoes["Ticker"] = df_pos_acoes["Ativo"].apply(_ticker_curto_local)
+                else:
+                    df_pos_acoes["Ticker"] = df_pos_acoes.get("Ticker").apply(_ticker_curto_local)
+
+                if "Mês/Ano" in df_pos_acoes.columns:
+                    dt_mes = pd.to_datetime("01/" + df_pos_acoes["Mês/Ano"].astype(str), format="%d/%m/%Y", errors="coerce")
+                    df_pos_acoes["PeriodoStr"] = dt_mes.dt.to_period("M").astype(str)
+                else:
+                    df_pos_acoes["PeriodoStr"] = None
+
+                if "Valor" not in df_pos_acoes.columns and "Valor de Mercado" in df_pos_acoes.columns:
+                    df_pos_acoes["Valor"] = df_pos_acoes["Valor de Mercado"]
+                df_pos_acoes["Valor"] = _to_num_series_local(df_pos_acoes.get("Valor"))
+
+                df_pos_acoes = df_pos_acoes[df_pos_acoes["Ticker"].astype(str).str.strip() != ""].copy()
+                df_pos_acoes = df_pos_acoes[df_pos_acoes["PeriodoStr"].notna()].copy()
+
+            tickers_pos = set(df_pos_acoes["Ticker"].dropna().astype(str).str.upper().tolist()) if not df_pos_acoes.empty else set()
+
+            # Fallback adicional via cache de ticker_info (quando existir)
+            tickers_cache = set()
+            try:
+                cache_df = carregar_cache_ticker_info()
+                if not cache_df.empty and "Ticker" in cache_df.columns:
+                    cache_df = cache_df.copy()
+                    cache_df["Ticker"] = cache_df["Ticker"].astype(str).str.strip().str.upper()
+                    qt = cache_df.get("QuoteType")
+                    if qt is not None:
+                        qt = qt.astype(str).str.strip().str.upper()
+                        cache_df = cache_df[qt.isin(["EQUITY", "ETF"])]
+                    tickers_cache = set(cache_df["Ticker"].dropna().tolist())
+            except Exception:
+                tickers_cache = set()
+
+            # Aplicar filtro de ações ao consolidado de proventos
+            df_base_prov = df_dividendos_consolidado.copy()
+            if "Ativo" in df_base_prov.columns:
+                df_base_prov["Ticker"] = df_base_prov["Ativo"].apply(_ticker_curto_local)
+            elif "Ticker" in df_base_prov.columns:
+                df_base_prov["Ticker"] = df_base_prov["Ticker"].apply(_ticker_curto_local)
+            else:
+                df_base_prov["Ticker"] = ""
+
+            tickers_validos = tickers_pos.union(tickers_cache)
+            df_base_prov = df_base_prov[df_base_prov["Ticker"].isin(tickers_validos)].copy() if tickers_validos else df_base_prov.iloc[0:0].copy()
+
+            st.success(f"✅ {len(df_base_prov)} registros (apenas Ações)")
             
             # Métricas
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.metric("Total Registros", len(df_dividendos_consolidado))
+                st.metric("Total Registros", len(df_base_prov))
             with col2:
-                st.metric("Valor Bruto", f"R$ {df_dividendos_consolidado.get('Valor Bruto', pd.Series()).sum():,.2f}")
+                st.metric("Valor Bruto", f"R$ {df_base_prov.get('Valor Bruto', pd.Series()).sum():,.2f}")
             with col3:
-                st.metric("Impostos", f"R$ {df_dividendos_consolidado.get('Impostos', pd.Series()).sum():,.2f}")
+                st.metric("Impostos", f"R$ {df_base_prov.get('Impostos', pd.Series()).sum():,.2f}")
             with col4:
-                st.metric("Valor Líquido", f"R$ {df_dividendos_consolidado.get('Valor Líquido', pd.Series()).sum():,.2f}")
+                st.metric("Valor Líquido", f"R$ {df_base_prov.get('Valor Líquido', pd.Series()).sum():,.2f}")
             
             st.markdown("---")
             
             # Filtros
             col_f1, col_f2, col_f3 = st.columns(3)
             
-            df_filtrado = df_dividendos_consolidado.copy()
+            df_filtrado = df_base_prov.copy()
             
             with col_f1:
                 if "Fonte Provento" in df_filtrado.columns:
@@ -1618,7 +1808,46 @@ with tab_proventos:
             
             # Gráficos de evolução
             st.markdown("---")
-            gerar_graficos_evolucao(df_filtrado, coluna_valor="Valor Líquido", coluna_data="Data", chave_periodo="periodo_div_cons")
+
+            # Série de posição mensal (somente ações) para cálculo do Dividend Yield (%)
+            serie_pos = None
+            try:
+                df_pos_f = df_pos_acoes.copy() if not df_pos_acoes.empty else pd.DataFrame()
+
+                # Reaplica filtro de usuário do widget (se existir)
+                if "Usuário" in df_pos_f.columns and "Usuário" in df_filtrado.columns:
+                    usuarios_sel_atual = None
+                    try:
+                        usuarios_sel_atual = usuarios_sel
+                    except Exception:
+                        usuarios_sel_atual = None
+                    if usuarios_sel_atual:
+                        df_pos_f = df_pos_f[df_pos_f["Usuário"].isin(usuarios_sel_atual)].copy()
+
+                # Reaplica filtro de ativo do widget (se existir)
+                ativos_sel_atual = None
+                try:
+                    ativos_sel_atual = ativos_sel
+                except Exception:
+                    ativos_sel_atual = None
+                if ativos_sel_atual:
+                    tick_sel = [_ticker_curto_local(a) for a in ativos_sel_atual]
+                    tick_sel = [t for t in tick_sel if t]
+                    if tick_sel:
+                        df_pos_f = df_pos_f[df_pos_f["Ticker"].isin(tick_sel)].copy()
+
+                if not df_pos_f.empty:
+                    serie_pos = df_pos_f.groupby("PeriodoStr")["Valor"].sum()
+            except Exception:
+                serie_pos = None
+
+            gerar_graficos_evolucao(
+                df_filtrado,
+                coluna_valor="Valor Líquido",
+                coluna_data="Data",
+                chave_periodo="periodo_div_cons",
+                serie_posicao_mensal=serie_pos,
+            )
             
             # Gráfico de top pagadores
             st.markdown("---")
@@ -2454,7 +2683,10 @@ with tab_consolidacao:
                 "vendas_opcoes": _mtime(str(ARQ_VENDAS_OPCOES)),
                 "caixa": _mtime(CAIXA_PATH),
                 "acoes_manuais": _mtime(ACOES_MANUAIS_PATH),
-                "rentab_version": 10,
+                # Gatilhos explícitos para mudanças no histórico mensal (BRL) de manuais
+                "acoes_manuais_hist_mensal": _mtime("data/investimentos_manuais_acoes_hist_mensal.parquet"),
+                "caixa_hist_full": _mtime("data/investimentos_manuais_caixa_hist_full.parquet"),
+                "rentab_version": 11,
             }
 
         def _preparar_caixa_base_rentabilidade(df_caixa: pd.DataFrame) -> pd.DataFrame:
@@ -3156,6 +3388,9 @@ with tab_posicao:
     if not df_acoes_man_consolidado_pos.empty:
         frames_consolidados.append(df_acoes_man_consolidado_pos)
 
+    # Referência em BRL (para comparações vs mês selecionado)
+    df_acoes_man_ref_brl = carregar_acoes_hist_mensal_cached(df_manual_acoes) if (df_manual_acoes is not None and not df_manual_acoes.empty) else pd.DataFrame()
+
     df_consolidado_geral = pd.concat(frames_consolidados, ignore_index=True) if frames_consolidados else pd.DataFrame()
 
     # Mesmos filtros da aba 💼 Investimento (inclui opção "Todos")
@@ -3178,7 +3413,21 @@ with tab_posicao:
 
         # Se a base mudou (ex: novo upload), força atualização
         try:
-            base_sig = f"{len(df_posicao_base)}|{','.join(df_posicao_base['Ticker'].astype(str).head(50).tolist())}"  # assinatura leve
+            # Assinatura leve, mas sensível a moeda/tipo (evita manter valores antigos quando muda BRL/USD/EUR)
+            sig_parts = []
+            if "Ticker" in df_posicao_base.columns:
+                sig_parts.append(df_posicao_base["Ticker"].astype(str))
+            if "Moeda" in df_posicao_base.columns:
+                sig_parts.append(df_posicao_base["Moeda"].astype(str))
+            if "Tipo" in df_posicao_base.columns:
+                sig_parts.append(df_posicao_base["Tipo"].astype(str))
+            if sig_parts:
+                sig = sig_parts[0]
+                for s in sig_parts[1:]:
+                    sig = sig + "|" + s
+                base_sig = f"{len(df_posicao_base)}|{','.join(sig.head(50).tolist())}"
+            else:
+                base_sig = f"{len(df_posicao_base)}"
         except Exception:
             base_sig = None
 
@@ -3263,8 +3512,8 @@ with tab_posicao:
                         frames_ref.append(df_acoes_avenue_padrao.copy())
                     if not df_caixa_consolidado_pos.empty:
                         frames_ref.append(df_caixa_consolidado_pos.copy())
-                    if not df_acoes_man_consolidado_pos.empty:
-                        frames_ref.append(df_acoes_man_consolidado_pos.copy())
+                    if df_acoes_man_ref_brl is not None and not df_acoes_man_ref_brl.empty:
+                        frames_ref.append(df_acoes_man_ref_brl.copy())
                     df_ref = pd.concat(frames_ref, ignore_index=True) if frames_ref else pd.DataFrame()
                     if not df_ref.empty and "Mês/Ano" in df_ref.columns:
                         df_mes_comparacao = df_ref[df_ref["Mês/Ano"] == mes_comparacao]
@@ -3338,8 +3587,8 @@ with tab_posicao:
                     frames_ref.append(df_acoes_avenue_padrao.copy())
                 if not df_caixa_consolidado_pos.empty:
                     frames_ref.append(df_caixa_consolidado_pos.copy())
-                if not df_acoes_man_consolidado_pos.empty:
-                    frames_ref.append(df_acoes_man_consolidado_pos.copy())
+                if df_acoes_man_ref_brl is not None and not df_acoes_man_ref_brl.empty:
+                    frames_ref.append(df_acoes_man_ref_brl.copy())
 
                 df_ref = pd.concat(frames_ref, ignore_index=True) if frames_ref else pd.DataFrame()
                 if df_ref.empty:
@@ -4351,13 +4600,38 @@ with tab_outros:
                             st.error(f"❌ Erro ao salvar alterações: {e}")
                 with col_sv2:
                     with st.expander("📊 Histórico mensal (posição gerada)", expanded=True):
-                        df_hist = carregar_acoes_hist_mensal_cached(df_acoes_view)
-                        if df_hist.empty:
+                        df_hist_brl = carregar_acoes_hist_mensal_cached(df_acoes_view)
+                        df_hist_moeda = carregar_acoes_posicao_cached(df_acoes_view)
+
+                        if df_hist_brl.empty and df_hist_moeda.empty:
                             st.info("Sem histórico mensal gerado ainda.")
                         else:
+                            # Monta visão única: BRL + Moeda
+                            df_brl = df_hist_brl.copy()
+                            df_fx = df_hist_moeda.copy()
+
+                            if not df_brl.empty:
+                                df_brl = df_brl.rename(columns={"Preço": "Preço (BRL)", "Valor": "Valor (BRL)"})
+                            if not df_fx.empty:
+                                df_fx = df_fx.rename(columns={"Preço": "Preço (Moeda)", "Valor": "Valor (Moeda)"})
+
+                            # Chaves para merge (tolerante a colunas) — evita usar Quantidade como chave (pode dar mismatch por float)
+                            chaves_preferidas = ["Usuário", "Tipo", "Ticker", "Mês/Ano", "Moeda"]
+                            chaves = [c for c in chaves_preferidas if (c in df_brl.columns and c in df_fx.columns)]
+
+                            if (not df_brl.empty) and (not df_fx.empty) and chaves:
+                                df_hist_view = df_brl.merge(df_fx, on=chaves, how="left")
+                            else:
+                                df_hist_view = df_brl if not df_brl.empty else df_fx
+
                             st.dataframe(
-                                df_hist[[c for c in ["Usuário", "Tipo", "Ticker", "Quantidade", "Preço", "Valor", "Mês/Ano"] if c in df_hist.columns]]
-                                .sort_values(["Ticker", "Mês/Ano"]) ,
+                                df_hist_view[[c for c in [
+                                    "Usuário", "Tipo", "Ticker", "Moeda", "Quantidade",
+                                    "Preço (Moeda)", "Valor (Moeda)",
+                                    "Preço (BRL)", "Valor (BRL)",
+                                    "Mês/Ano",
+                                ] if c in df_hist_view.columns]]
+                                .sort_values([c for c in ["Ticker", "Mês/Ano"] if c in df_hist_view.columns]) ,
                                 use_container_width=True,
                                 hide_index=True,
                             )
