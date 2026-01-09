@@ -558,11 +558,14 @@ def gerar_graficos_evolucao(
                     row_heights=[0.35, 0.65],
                 )
 
+                dy_text = [f"{v:.2f}%" if (v is not None and not pd.isna(v)) else "" for v in dy]
                 fig_bar.add_trace(
                     go.Scatter(
                         x=df_group.index,
                         y=dy,
-                        mode="lines+markers",
+                        mode="lines+markers+text",
+                        text=dy_text,
+                        textposition="top center",
                         name="Dividend Yield (%)",
                         hovertemplate="%{x}<br>Yield: %{y:.2f}%<extra></extra>",
                     ),
@@ -602,24 +605,42 @@ def gerar_graficos_evolucao(
             fig_bar.update_traces(textposition="outside", cliponaxis=False, marker_color=bar_colors)
         
         # Adicionar linha de média móvel se selecionada
+        # - Sem Yield: MM em R$ (sobre os dividendos)
+        # - Com Yield: MM em % (sobre o Dividend Yield)
         if periodo_mm != "Sem MM":
             periodo_num = int(periodo_mm.split()[0])
-            mm_values = pd.Series(df_group.values).rolling(window=periodo_num, center=False, min_periods=1).mean()
-            trace_mm = go.Scatter(
-                x=df_group.index,
-                y=mm_values,
-                mode="lines+markers",
-                name=f"MM {periodo_num}m",
-                line=dict(color="red", width=3, dash="dash"),
-                marker=dict(size=6),
-                hovertemplate="%{x}<br>MM: R$ %{y:,.2f}<extra></extra>",
-            )
-
-            # Quando o gráfico está em subplots (Yield + Barras), a MM deve ficar no painel das barras.
-            if "make_subplots" in str(type(fig_bar)) and usar_yield:
-                fig_bar.add_trace(trace_mm, row=2, col=1)
+            if usar_yield:
+                try:
+                    # dy foi calculado acima (np.array). Se não existir por algum motivo, ignora.
+                    dy_series = pd.Series(dy, index=df_group.index)
+                    mm_yield = dy_series.rolling(window=periodo_num, center=False, min_periods=1).mean()
+                    fig_bar.add_trace(
+                        go.Scatter(
+                            x=df_group.index,
+                            y=mm_yield.values,
+                            mode="lines",
+                            name=f"MM Yield {periodo_num}m",
+                            line=dict(color="red", width=3, dash="dash"),
+                            hovertemplate="%{x}<br>MM Yield: %{y:.2f}%<extra></extra>",
+                        ),
+                        row=1,
+                        col=1,
+                    )
+                except Exception:
+                    pass
             else:
-                fig_bar.add_trace(trace_mm)
+                mm_values = pd.Series(df_group.values).rolling(window=periodo_num, center=False, min_periods=1).mean()
+                fig_bar.add_trace(
+                    go.Scatter(
+                        x=df_group.index,
+                        y=mm_values,
+                        mode="lines+markers",
+                        name=f"MM {periodo_num}m",
+                        line=dict(color="red", width=3, dash="dash"),
+                        marker=dict(size=6),
+                        hovertemplate="%{x}<br>MM: R$ %{y:,.2f}<extra></extra>",
+                    )
+                )
         
         fig_bar.update_layout(
             xaxis_tickmode="array",
